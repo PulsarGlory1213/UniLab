@@ -62,6 +62,9 @@ def run_mujoco_playback(
     from unilab.visualization import render_many
 
     cam_kw = dict(camera_kwargs or {})
+    render_width = int(cam_kw.pop("render_width", 1280))
+    render_height = int(cam_kw.pop("render_height", 720))
+    render_num_processes = int(cam_kw.pop("render_num_processes", 8))
     use_tracking = bool(cam_kw.pop("cam_tracking", False))
     tracking_env_idx = int(cam_kw.pop("cam_tracking_env_idx", 0))
     tracking_extra_envs = int(cam_kw.pop("cam_tracking_extra_envs", 2))
@@ -81,8 +84,8 @@ def run_mujoco_playback(
             frames = render_many.render_states_get_frames_tracking(
                 state_list,
                 model_files,
-                width=1280,
-                height=720,
+                width=render_width,
+                height=render_height,
                 tracking_env_idx=tracking_env_idx,
                 max_extra_envs=tracking_extra_envs,
                 cam_distance=cam_kw.get("cam_distance", 2.0),
@@ -95,8 +98,9 @@ def run_mujoco_playback(
             frames = render_many.render_states_get_frames(
                 state_list,
                 model_files,
-                width=1280,
-                height=720,
+                width=render_width,
+                height=render_height,
+                num_processes=render_num_processes,
                 camera_id=-1,
                 render_spacing=effective_spacing,
                 marker_positions_list=marker_positions_list,

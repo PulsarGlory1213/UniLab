@@ -47,6 +47,7 @@ class AllegroRotationGraspCfg(AllegroRotationPPOCfg):
 @registry.env("AllegroInhandRotationGrasp", sim_backend="motrix")
 class AllegroRotationGrasp(AllegroRotationPPO):
     _cfg: AllegroRotationGraspCfg
+    _COLLECTOR_NAME = "AllegroInhandRotationGrasp"
     _CONTACT_SENSORS = ("ff_contact", "mf_contact", "rf_contact", "th_contact")
 
     def __init__(
@@ -114,7 +115,7 @@ class AllegroRotationGrasp(AllegroRotationPPO):
 
         self._grasp_target_reached_notified = True
         print(
-            "[AllegroInhandRotationGrasp] Grasp collection target reached "
+            f"[{self._COLLECTOR_NAME}] Grasp collection target reached "
             f"({total}/{target}). Program stopped."
         )
 

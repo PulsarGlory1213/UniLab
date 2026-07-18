@@ -1,0 +1,65 @@
+<mujoco model="leap hand falling ball catch scene">
+  <statistic center="0 0 0.62" extent="0.45"/>
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="135" elevation="-20"/>
+  </visual>
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.20 0.32 0.48"
+             rgb2="0.04 0.07 0.12" width="512" height="3072"/>
+    <texture type="2d" name="catch_ground_tex" builtin="checker" mark="edge"
+             rgb1="0.18 0.34 0.52" rgb2="0.08 0.20 0.34"
+             markrgb="0.40 0.58 0.74" width="512" height="512"/>
+    <material name="catch_ground" texture="catch_ground_tex"
+              texuniform="true" texrepeat="12 12" reflectance="0.15"/>
+  </asset>
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" pos="0 0 0" size="0 0 0.05" type="plane"
+          material="catch_ground"/>
+    <body name="ball" pos="0.013 0.022 0.85">
+      <freejoint name="ball_joint"/>
+      <geom name="ball" type="sphere" size="0.0335" mass="0.057" condim="6"
+            friction="1.2 0.04 0.01" solimp="0.90 0.95 0.001" solref="0.01 0.30"
+            rgba="0.95 0.3 0.12 1"/>
+    </body>
+  </worldbody>
+  <sensor>
+    <!-- Contact truth comes from collision geoms, not offset body origins. -->
+    <contact name="leap_ff_contact" geom1="fingertip_collision"
+             geom2="ball" data="found" num="1" reduce="mindist"/>
+    <contact name="leap_mf_contact" geom1="fingertip_2_collision"
+             geom2="ball" data="found" num="1" reduce="mindist"/>
+    <contact name="leap_rf_contact" geom1="fingertip_3_collision"
+             geom2="ball" data="found" num="1" reduce="mindist"/>
+    <contact name="leap_th_contact" geom1="thumb_fingertip_collision"
+             geom2="ball" data="found" num="1" reduce="mindist"/>
+    <contact name="leap_palm_contact" geom1="palm_lower_collision"
+             geom2="ball" data="found" num="1" reduce="mindist"/>
+    <!-- Explicit pad-frame measurements keep reward geometry independent of mesh origins. -->
+    <framepos name="leap_ff_pad_pos" objtype="site" objname="ff_pad_center"/>
+    <framepos name="leap_ff_pad_normal_pos" objtype="site" objname="ff_pad_normal"/>
+    <framepos name="leap_mf_pad_pos" objtype="site" objname="mf_pad_center"/>
+    <framepos name="leap_mf_pad_normal_pos" objtype="site" objname="mf_pad_normal"/>
+    <framepos name="leap_rf_pad_pos" objtype="site" objname="rf_pad_center"/>
+    <framepos name="leap_rf_pad_normal_pos" objtype="site" objname="rf_pad_normal"/>
+    <framepos name="leap_th_pad_pos" objtype="site" objname="th_pad_center"/>
+    <framepos name="leap_th_pad_normal_pos" objtype="site" objname="th_pad_normal"/>
+  </sensor>
+  <keyframe>
+    <!--
+      Hand qpos/ctrl order follows the compiled MJCF DOF order:
+        index finger: joint 1 (base flex), 0 (spread), 2 (middle), 3 (tip)
+        middle finger: joint 5 (base flex), 4 (spread), 6 (middle), 7 (tip)
+        ring finger: joint 9 (base flex), 8 (spread), 10 (middle), 11 (tip)
+        thumb: joint 12, 13, 14, 15
+      The pose below is the photo-derived catch cup used by LeapBallCatchCfg.
+      It is already curved around the MCP row; runtime control only adds inward
+      curl and small policy residuals, while keeping the spread axes constrained.
+    -->
+    <key name="home"
+      qpos="0.70 -0.10 0.60 0.45 0.74 0.0 0.66 0.50 0.80 0.10 0.72 0.55 0.80 0.60 0.90 0.60 0.013 0.022 0.85 1 0 0 0"
+      ctrl="0.70 -0.10 0.60 0.45 0.74 0.0 0.66 0.50 0.80 0.10 0.72 0.55 0.80 0.60 0.90 0.60"/>
+  </keyframe>
+</mujoco>

@@ -150,6 +150,7 @@ class MotrixBackend(SimBackend):
         base_name: str = "base",
         np_dtype=np.float32,
         add_body_sensors: bool = False,
+        position_actuator_gains: dict | None = None,
         max_iterations: int | None = DEFAULT_MOTRIX_MAX_ITERATIONS,
         push_body_name: str | None = None,
     ):
@@ -235,6 +236,10 @@ class MotrixBackend(SimBackend):
             # TODO: switch to motrixsim model-level actuator gain API once available.
             self._default_actuator_kp[idx] = _first_scalar(actuator.get_kp_override(self._data))
             self._default_actuator_kd[idx] = _first_scalar(actuator.get_kd_override(self._data))
+        self._has_position_actuator_baseline = position_actuator_gains is not None
+        if position_actuator_gains is not None:
+            self._configure_position_actuator_baseline(position_actuator_gains)
+            self._apply_position_actuator_baseline(self._data, self._num_envs)
         self._floating_base_quat_indices: tuple[np.ndarray, ...] = tuple(
             np.asarray(floating_base.dof_pos_indices[3:7], dtype=np.intp)
             for floating_base in getattr(self._model, "floating_bases", [])
@@ -653,6 +658,9 @@ class MotrixBackend(SimBackend):
         t0 = time.perf_counter()
         data_slice.reset(self._model)
         timing["set_state_data_reset_ms"] = (time.perf_counter() - t0) * 1000.0
+
+        if self._has_position_actuator_baseline:
+            self._apply_position_actuator_baseline(data_slice, len(env_indices))
 
         t0 = time.perf_counter()
         self._clear_applied_body_forces(env_indices, env_ids_intp=env_ids_intp)
@@ -1577,6 +1585,38 @@ class MotrixBackend(SimBackend):
         for actuator in self._position_actuators:
             # TODO(motrixsim#1384): drop the copy once strided NumPy views are accepted.
             actuator.set_kp_override(data_slice, np.ascontiguousarray(kp[:, int(actuator.index)]))
+
+    def _configure_position_actuator_baseline(self, gains: dict) -> None:
+        if not self._supports_position_actuator_gains:
+            raise NotImplementedError(
+                "Motrix position_actuator_gains requires an all-position-actuator model"
+            )
+        actuator_ids = np.arange(self.num_actuators, dtype=np.intp)[
+            gains.get("actuator_ids", slice(None))
+        ]
+        actuator_ids = np.atleast_1d(actuator_ids)
+        kp = np.broadcast_to(
+            np.asarray(gains["kp"], dtype=np.float32),
+            actuator_ids.shape,
+        )
+        kd = np.broadcast_to(
+            np.asarray(gains["kd"], dtype=np.float32),
+            actuator_ids.shape,
+        )
+        self._default_actuator_kp[actuator_ids] = kp
+        self._default_actuator_kd[actuator_ids] = kd
+
+    def _apply_position_actuator_baseline(self, data_slice, num_envs: int) -> None:
+        kp = np.broadcast_to(
+            self._default_actuator_kp,
+            (num_envs, self.num_actuators),
+        )
+        kd = np.broadcast_to(
+            self._default_actuator_kd,
+            (num_envs, self.num_actuators),
+        )
+        self._set_position_actuator_kp_override(data_slice, kp)
+        self._set_position_actuator_kd_override(data_slice, kd)
 
     def _set_position_actuator_kd_override(self, data_slice, kd: np.ndarray) -> None:
         if not self._supports_position_actuator_gains:

@@ -30,6 +30,7 @@ class AllegroBaseCfg(EnvCfg):
     ctrl_dt: float = 0.05
     noise_config: NoiseConfig = field(default_factory=NoiseConfig)
     control_config: ControlConfig = field(default_factory=ControlConfig)
+    base_body_name: str = "palm"
 
 
 class AllegroBaseEnv(NpEnv):

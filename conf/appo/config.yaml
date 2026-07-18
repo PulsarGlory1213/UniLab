@@ -77,6 +77,9 @@ training:
   play_render_mode: auto
   play_env_num: 16
   play_steps: 150
+  render_width: 1280
+  render_height: 720
+  render_num_processes: 8
   cam_distance: 6.0
   cam_elevation: -20.0
   cam_azimuth: 90.0
@@ -84,6 +87,11 @@ training:
   cam_tracking_env_idx: 0
   cam_tracking_extra_envs: 2
   replay_queue_size: null
+  checkpoint_video:
+    enabled: false
+    play_steps: 200
+    play_env_num: 1
+    output_subdir: videos
 
 interactive:
   action_mode: zero

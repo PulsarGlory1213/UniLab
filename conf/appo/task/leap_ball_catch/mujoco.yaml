@@ -1,0 +1,98 @@
+# @package _global_
+defaults:
+  - /task/leap_inhand/mujoco
+  - _self_
+
+training:
+  task_name: LeapBallCatch
+  sim_backend: mujoco
+  cam_lookat: [0.0, 0.0, 0.62]
+
+reward:
+  scales:
+    rotate: 0.0
+    obj_linvel: 0.0
+    intercept: 0.0
+    finger_approach: 0.0
+    finger_curl_velocity: 0.0
+    closing_grasp_pose: 0.0
+    thumb_pregrasp: 0.0
+    natural_grasp_pose: 0.0
+    opposition_geometry: 0.0
+    ring_support: 0.0
+    touch_without_wrap: 0.0
+    reference_pose_tracking: 6.0
+    early_closure: -10.0
+    finger_pad_progress: 10.0
+    finger_closing: 4.0
+    pocket_depth: 6.0
+    wrap_progress: 12.0
+    finger_wrap: 30.0
+    hold: 15.0
+    finger_gap: -8.0
+    finger_synergy: -8.0
+    finger_jitter: -1.0
+    palm_only: -12.0
+    palm_contact: 0.0
+    pocket_without_finger_contact: 0.0
+    grasp_stability: 0.0
+    unnatural_joint_pose: 0.0
+    thumb_crossing: 0.0
+    ball_bounce: -18.0
+    action_rate: -2.0
+    pose_diff: 0.0
+    torque: -0.0005
+    # Fast interception is required; hold velocity terms handle post-contact stability.
+    work: 0.0
+    # Drop is a one-step terminal event and rewards are integrated by ctrl_dt.
+    # At 100 Hz, -300 contributes -3.0 and cannot be cheaper than dropping early.
+    drop: -150.0
+  angvel_clip_min: -0.5
+  angvel_clip_max: 0.5
+  reset_z_threshold: 0.4
+
+env:
+  gen_grasp: true
+  # Palm-frame offset from the main MCP row to the desired finger-root pocket.
+  grasp_pocket_offset: [0.020, 0.0, -0.050]
+  initial_pose: [0.70, -0.10, 0.60, 0.45, 0.74, 0.0, 0.66, 0.50, 0.80, 0.10, 0.72, 0.55, 0.80, 0.60, 0.90, 0.60]
+  catch_pose: [0.98, -0.10, 0.94, 0.67, 1.06, 0.0, 1.04, 0.75, 1.16, 0.10, 1.14, 0.83, 1.10, 0.68, 1.18, 0.82]
+  catch_close_trigger_height: 0.11
+  catch_full_close_height: 0.015
+  early_closure_tolerance: 0.12
+  reference_pose_sigma: 4.0
+  reference_pose_joint_weights: [1.3, 4.0, 1.5, 1.6, 1.3, 4.0, 1.5, 1.6, 1.3, 4.0, 1.5, 1.6, 4.0, 1.6, 1.7, 1.7]
+  catch_spread_tolerance: 0.08
+  catch_spread_limit: 0.15
+  locked_catch_dof_indices: [12]
+  pose_preview: none
+  # Collision-distance search result: thumb approaches from behind the ball.
+  thumb_pregrasp_pose: [0.8, 0.6, 0.9, 0.6]
+  # Human-like cup pose used only as a shaping target near capture time.
+  natural_grasp_pose: [0.62, -0.14, 0.78, 0.38, 0.74, 0.0, 0.88, 0.46, 0.82, 0.13, 0.96, 0.52, 0.66, 0.42, 0.50, 0.24]
+  # Active close target: the policy must curl the fingers toward this pose while the ball is arriving.
+  closing_grasp_pose: [0.82, -0.16, 0.95, 0.42, 0.94, 0.0, 1.06, 0.52, 1.04, 0.14, 1.16, 0.60, 0.72, 0.48, 0.58, 0.28]
+  # Reset-only release uncertainty: position, height, and incoming velocity.
+  ball_spawn_x_range: [0.008, 0.024]
+  ball_spawn_y_range: [0.016, 0.028]
+  ball_spawn_height_range: [0.82, 0.88]
+  ball_horizontal_velocity_range: [-0.08, 0.08]
+  ball_vertical_velocity_range: [-0.08, 0.0]
+  ball_radius: 0.0335
+  fingertip_surface_margin: 0.006
+  max_episode_seconds: 5.0
+  ctrl_dt: 0.01
+  grasp_cache_path: caches/leap_ball_catch.npy
+  # 100 Hz targets give about 22 policy decisions before the falling ball arrives.
+  control_config:
+    action_scale: 0.14
+    kp: 34.0
+    kd: 2.20
+  domain_rand:
+    randomize_base_mass: false
+    random_com: false
+    randomize_gravity: false
+    push_robots: false
+    joint_noise: 0.01
+    ball_vel_noise: 0.0
+    ball_z_offset: 0.0

@@ -1,0 +1,81 @@
+# @package _global_
+training:
+  task_name: LeapInhandRotation
+  sim_backend: mujoco
+  play_steps: 200
+  render_spacing: 0.5
+  cam_distance: 0.45
+  cam_lookat: [0.0, 0.0, 0.52]
+  cam_elevation: -25.0
+  cam_azimuth: 135.0
+  play_env_num: 1
+  render_width: 640
+  render_height: 352
+  render_num_processes: 1
+  replay_queue_size: 4
+  checkpoint_video:
+    enabled: true
+    play_steps: 200
+    play_env_num: 1
+    output_subdir: videos
+algo:
+  num_envs: 1024
+  steps_per_env: 8
+  max_iterations: 1000
+  save_interval: 500
+  algorithm:
+    value_loss_coef: 4.0
+    entropy_coef: 0.006
+    learning_rate: 0.0003
+    desired_kl: 0.02
+    adaptive_kl_factor: 1.5
+    adaptive_lr_factor: 1.2
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: adaptive
+  actor:
+    hidden_dims: [512, 256, 128]
+    activation: elu
+    obs_normalization: true
+    distribution_cfg:
+      class_name: rsl_rl.modules.distribution.GaussianDistribution
+      init_std: 0.65
+      std_type: scalar
+  critic:
+    hidden_dims: [512, 256, 128]
+    activation: elu
+    obs_normalization: true
+reward:
+  scales:
+    rotate: 2.0
+    obj_linvel: -0.3
+    pose_diff: -0.03
+    torque: -0.01
+    work: -0.001
+    drop: 0.0
+  angvel_clip_min: -0.5
+  angvel_clip_max: 0.5
+  reset_z_threshold: 0.58
+env:
+  gen_grasp: false
+  max_episode_seconds: 20.0
+  grasp_cache_path: caches/leap_hand_allegro_style_20k.npy
+  rotation_axis: [0.0, 0.0, 1.0]
+  ctrl_dt: 0.02
+  control_config:
+    action_scale: 0.08
+    kp: 20.0
+    kd: 1.5
+  domain_rand:
+    randomize_base_mass: false
+    random_com: false
+    randomize_gravity: false
+    push_robots: false
+    joint_noise: 0.015
+    ball_vel_noise: 0.01
+    ball_z_offset: 0.0

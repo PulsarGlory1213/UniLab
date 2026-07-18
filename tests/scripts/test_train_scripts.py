@@ -149,6 +149,37 @@ def _appo_cfg(overrides=None):
         return compose("config", overrides=_normalize_overrides(overrides))
 
 
+def test_appo_checkpoint_video_callback_targets_exact_checkpoint(tmp_path) -> None:
+    mod = _load_script("train_appo")
+    cfg = _appo_cfg(["task=leap_inhand/mujoco"])
+    checkpoint = tmp_path / "model_500.pt"
+    captured: dict[str, Any] = {}
+
+    def fake_play(playback_cfg, rl_cfg, **kwargs):
+        captured["cfg"] = playback_cfg
+        captured["rl_cfg"] = rl_cfg
+        captured["resolved"] = kwargs["resolve_checkpoint_path"](playback_cfg)
+        captured["output_video"] = kwargs["output_video"]
+        return str(kwargs["output_video"])
+
+    callback = mod.build_checkpoint_video_callback(
+        cfg,
+        {"algo": "appo"},
+        play_fn=fake_play,
+        log_dir=str(tmp_path),
+        tracker=None,
+    )
+
+    assert callback is not None
+    callback(str(checkpoint), 500)
+
+    assert captured["cfg"].training.play_render_mode == "record"
+    assert captured["cfg"].training.play_env_num == 1
+    assert captured["cfg"].training.play_steps == 200
+    assert captured["resolved"] == (str(checkpoint), str(tmp_path))
+    assert captured["output_video"] == tmp_path / "videos" / "model_500.mp4"
+
+
 def _hora_distill_cfg(overrides=None):
     """Compose the HORA distillation Hydra config.
 

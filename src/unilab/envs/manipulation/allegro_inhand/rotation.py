@@ -208,11 +208,7 @@ class AllegroRotationDomainRandomizationProvider(DomainRandomizationProvider):
 
         init_ctrl = np.asarray(hand_qpos, dtype=dtype)
         init_ball_pos = np.asarray(ball_pos, dtype=dtype)
-        dof_pos_norm = 2.0 * (init_ctrl - env._dof_mid) / (env._dof_range + 1e-8)
-        init_obs = np.concatenate([dof_pos_norm, init_ctrl, init_ball_pos], axis=1, dtype=dtype)
-        obs_lag_history = build_obs_lag_history(init_obs, env._NUM_LAG_STEPS, env._NUM_OBS_PER_STEP)
-
-        return {
+        info_updates = {
             "current_actions": zero_actions(num_reset, env._num_action),
             "last_actions": zero_actions(num_reset, env._num_action),
             "prev_ctrl": init_ctrl,
@@ -220,8 +216,14 @@ class AllegroRotationDomainRandomizationProvider(DomainRandomizationProvider):
             "prev_dof_pos": init_ctrl.copy(),
             "prev_ball_pos": init_ball_pos.copy(),
             "prev_ball_quat": np.asarray(ball_quat, dtype=dtype).copy(),
-            "obs_lag_history": obs_lag_history,
+            "prev_ball_linvel": np.zeros((num_reset, 3), dtype=dtype),
+            "prev_ball_angvel": np.zeros((num_reset, 3), dtype=dtype),
         }
+        init_obs = env._build_current_obs(info_updates, init_ctrl, init_ball_pos)
+        info_updates["obs_lag_history"] = build_obs_lag_history(
+            init_obs, env._NUM_LAG_STEPS, env._NUM_OBS_PER_STEP
+        )
+        return info_updates
 
     def build_reset_plan(self, env: Any, env_ids: np.ndarray) -> ResetPlan:
         num_reset = len(env_ids)
@@ -273,7 +275,7 @@ class AllegroRotationPPO(AllegroBaseEnv):
             cfg.scene,
             num_envs,
             cfg.sim_dt,
-            base_name="palm",
+            base_name=cfg.base_body_name,
             push_body_name=cfg.domain_rand.push_body_name,
             add_body_sensors=True,
             position_actuator_gains={
@@ -294,7 +296,10 @@ class AllegroRotationPPO(AllegroBaseEnv):
         self._grasp_cache_loaded = False
 
         self._init_reward_functions()
-        self._init_domain_randomization(AllegroRotationDomainRandomizationProvider())
+        self._init_domain_randomization(self._domain_randomization_provider())
+
+    def _domain_randomization_provider(self) -> DomainRandomizationProvider:
+        return AllegroRotationDomainRandomizationProvider()
 
     @property
     def obs_groups_spec(self) -> dict[str, int]:
@@ -418,6 +423,8 @@ class AllegroRotationPPO(AllegroBaseEnv):
         state.info["curr_dof_pos"] = dof_pos.copy()
         state.info["curr_ball_pos"] = ball_pos.copy()
         state.info["curr_ball_quat"] = ball_quat.copy()
+        state.info["curr_ball_linvel"] = ball_linvel.copy()
+        state.info["curr_ball_angvel"] = ball_angvel.copy()
 
         state.info["prev_dof_pos"] = dof_pos.copy()
         state.info["prev_ball_pos"] = ball_pos.copy()
@@ -473,9 +480,9 @@ class AllegroRotationPPO(AllegroBaseEnv):
         info["log"] = log
         return reward * self._cfg.ctrl_dt
 
-    def _compute_obs(
+    def _build_current_obs(
         self, info: dict[str, Any], dof_pos: np.ndarray, ball_pos: np.ndarray
-    ) -> dict[str, np.ndarray]:
+    ) -> np.ndarray:
         dtype = get_global_dtype()
         targets = info["prev_ctrl"]
         dof_pos_norm = 2.0 * (dof_pos - self._dof_mid) / (self._dof_range + 1e-8)
@@ -488,9 +495,13 @@ class AllegroRotationPPO(AllegroBaseEnv):
                 * noise_cfg.scale_joint_angle
             )
 
-        current_obs = np.concatenate(
-            [dof_pos_norm, targets, ball_pos.astype(dtype)], axis=1, dtype=dtype
-        )
+        return np.concatenate([dof_pos_norm, targets, ball_pos.astype(dtype)], axis=1, dtype=dtype)
+
+    def _compute_obs(
+        self, info: dict[str, Any], dof_pos: np.ndarray, ball_pos: np.ndarray
+    ) -> dict[str, np.ndarray]:
+        dtype = get_global_dtype()
+        current_obs = self._build_current_obs(info, dof_pos, ball_pos)
 
         num_envs = dof_pos.shape[0]
         obs_lag_history = info.get(

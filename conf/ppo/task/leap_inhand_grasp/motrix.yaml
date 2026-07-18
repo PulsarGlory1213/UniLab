@@ -1,0 +1,74 @@
+# @package _global_
+training:
+  task_name: LeapInhandRotationGrasp
+  sim_backend: motrix
+  no_play: true
+  render_spacing: 0.5
+  cam_distance: 0.45
+  cam_lookat: [0.0, 0.0, 0.52]
+  cam_elevation: -25.0
+algo:
+  num_envs: 4096
+  num_steps_per_env: 8
+  max_iterations: 1000
+  obs_groups:
+    actor: [policy]
+    critic: [policy]
+  actor:
+    class_name: rsl_rl.models.MLPModel
+    hidden_dims: [512, 256, 128]
+    activation: elu
+    obs_normalization: true
+    distribution_cfg:
+      class_name: rsl_rl.modules.distribution.GaussianDistribution
+      init_std: 1.0
+      std_type: scalar
+  critic:
+    class_name: rsl_rl.models.MLPModel
+    hidden_dims: [512, 256, 128]
+    activation: elu
+    obs_normalization: true
+  algorithm:
+    value_loss_coef: 4.0
+    desired_kl: 0.02
+reward:
+  scales:
+    rotate: 0.0
+    obj_linvel: 0.0
+    pose_diff: 0.0
+    torque: 0.0
+    work: 0.0
+    drop: 0.0
+  angvel_clip_min: -0.5
+  angvel_clip_max: 0.5
+  reset_z_threshold: 0.58
+env:
+  gen_grasp: true
+  max_episode_seconds: 3.0
+  grasp_cache_path: caches/leap_hand_allegro_style_20k.npy
+  grasp_collection_target: 20000
+  grasp_auto_save: true
+  grasp_quality_check: true
+  grasp_min_contacts: 4
+  grasp_pad_target_distances: [0.036, 0.039, 0.050, 0.040]
+  grasp_pad_surface_tolerance: 0.004
+  grasp_pad_alignment_minimums: [0.65, 0.65, 0.25, 0.65]
+  grasp_opposition_dot_max: -0.20
+  rotation_axis: [0.0, 0.0, 1.0]
+  ctrl_dt: 0.02
+  control_config:
+    action_scale: 0.08
+    kp: 20.0
+    kd: 1.5
+  domain_rand:
+    randomize_base_mass: false
+    random_com: false
+    randomize_gravity: false
+    push_robots: false
+    joint_noise: 0.10
+    ball_vel_noise: 0.0
+    ball_z_offset: 0.0
+play_profile:
+  enabled: true
+  env:
+    render_spacing: 1.0

@@ -160,6 +160,7 @@ def play_appo(
     *,
     root_dir: Path | None = None,
     resolve_checkpoint_path: Callable[[DictConfig], tuple[str | None, str | None]] | None = None,
+    output_video: str | Path | None = None,
 ) -> str | None:
     """Play mode for the default APPO runtime.
 
@@ -317,7 +318,13 @@ def play_appo(
         play_video_path = env.run_playback_mode(
             play_render_mode=getattr(cfg.training, "play_render_mode", "auto"),
             play_steps=getattr(cfg.training, "play_steps", None),
-            output_video=os.path.join(load_path_dir, "play_video.mp4") if load_path_dir else None,
+            output_video=(
+                str(output_video)
+                if output_video is not None
+                else os.path.join(load_path_dir, "play_video.mp4")
+                if load_path_dir
+                else None
+            ),
             render_spacing=float(
                 getattr(cfg.training, "render_spacing", getattr(env.cfg, "render_spacing", 1.0))
             ),
@@ -340,6 +347,9 @@ def play_appo(
                 dtype=np.float32,
             ),
             camera_kwargs={
+                "render_width": getattr(cfg.training, "render_width", 1280),
+                "render_height": getattr(cfg.training, "render_height", 720),
+                "render_num_processes": getattr(cfg.training, "render_num_processes", 8),
                 "cam_distance": cfg.training.cam_distance,
                 "cam_elevation": cfg.training.cam_elevation,
                 "cam_azimuth": cfg.training.cam_azimuth,
@@ -354,6 +364,49 @@ def play_appo(
         print(f"Saving video to {play_video_path} ...")
     print("Done.")
     return play_video_path
+
+
+def build_checkpoint_video_callback(
+    cfg: DictConfig,
+    rl_cfg: dict[str, Any],
+    *,
+    play_fn: Callable[..., str | None],
+    log_dir: str,
+    tracker: ExperimentTracker | None,
+) -> Callable[[str, int], None] | None:
+    video_cfg = OmegaConf.select(cfg, "training.checkpoint_video", default=None)
+    if video_cfg is None or not bool(video_cfg.get("enabled", False)):
+        return None
+
+    def record_checkpoint(checkpoint_path: str, iteration: int) -> None:
+        output_dir = Path(log_dir) / str(video_cfg.get("output_subdir", "videos"))
+        output_path = output_dir / f"model_{iteration}.mp4"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        playback_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        playback_cfg.training.play_render_mode = "record"
+        playback_cfg.training.play_env_num = int(video_cfg.get("play_env_num", 1))
+        playback_cfg.training.play_steps = int(video_cfg.get("play_steps", 200))
+        try:
+            video_path = play_fn(
+                playback_cfg,
+                rl_cfg,
+                root_dir=ROOT_DIR,
+                resolve_checkpoint_path=lambda _current_cfg: (checkpoint_path, log_dir),
+                output_video=output_path,
+            )
+            if tracker is not None:
+                tracker.log_video(
+                    video_path,
+                    key=f"media/checkpoints/model_{iteration}",
+                )
+        except Exception as exc:
+            print(
+                f"WARNING: checkpoint model_{iteration}.pt was saved, but video "
+                f"recording failed: {type(exc).__name__}: {exc}"
+            )
+
+    return record_checkpoint
 
 
 @hydra.main(version_base="1.3", config_path="../conf/appo", config_name="config")
@@ -424,11 +477,23 @@ def main(cfg: DictConfig) -> None:
             )
 
             try:
-                runner.learn(
-                    max_iterations=cfg.algo.max_iterations,
-                    save_interval=cfg.algo.save_interval,
+                learn_kwargs: dict[str, Any] = {
+                    "max_iterations": cfg.algo.max_iterations,
+                    "save_interval": cfg.algo.save_interval,
+                    "log_dir": log_dir,
+                    "logger_type": cfg.training.logger,
+                }
+                checkpoint_callback = build_checkpoint_video_callback(
+                    cfg,
+                    rl_cfg,
+                    play_fn=appo_runtime.play_fn,
                     log_dir=log_dir,
-                    logger_type=cfg.training.logger,
+                    tracker=tracker,
+                )
+                if checkpoint_callback is not None:
+                    learn_kwargs["checkpoint_callback"] = checkpoint_callback
+                runner.learn(
+                    **learn_kwargs,
                 )
                 if tracker is not None:
                     tracker.update_summary(getattr(runner, "last_run_summary", None))

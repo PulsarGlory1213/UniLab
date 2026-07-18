@@ -103,6 +103,8 @@ def create_backend(
         MotrixBackend, motrix_available = _load_motrix_backend()
         if not motrix_available:
             raise ImportError("MotrixSim not available, install motrixsim package")
+        if position_actuator_gains is not None:
+            kwargs["position_actuator_gains"] = position_actuator_gains
         if motrix_max_iterations is not None:
             kwargs["max_iterations"] = motrix_max_iterations
         return cast(SimBackend, MotrixBackend(scene, num_envs, sim_dt, **kwargs))

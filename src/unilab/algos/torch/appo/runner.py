@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from collections import deque
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
@@ -203,6 +204,7 @@ class APPORunner(AsyncRunner):
         save_interval: int = 50,
         log_dir: str = "logs",
         logger_type: str = "tensorboard",
+        checkpoint_callback: Callable[[str, int], None] | None = None,
     ) -> None:
         os.makedirs(log_dir, exist_ok=True)
         train_start_wall = time.time()
@@ -427,6 +429,8 @@ class APPORunner(AsyncRunner):
                 ckpt_path = os.path.join(log_dir, f"model_{iteration}.pt")
                 torch.save(learner.get_state_dict(), ckpt_path)
                 logger.log_save(ckpt_path)
+                if checkpoint_callback is not None:
+                    checkpoint_callback(ckpt_path, iteration)
 
         ckpt_path = os.path.join(log_dir, f"model_{max_iterations}.pt")
         torch.save(learner.get_state_dict(), ckpt_path)

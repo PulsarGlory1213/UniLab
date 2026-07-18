@@ -698,6 +698,40 @@ def test_create_backend_routes_motrix_max_iterations_override(monkeypatch) -> No
     assert "motrix_max_iterations" not in captured["kwargs"]
 
 
+def test_create_backend_routes_position_actuator_gains_to_motrix(monkeypatch) -> None:
+    import unilab.base.backend as backend_factory
+    from unilab.base.scene import SceneCfg
+
+    captured: dict[str, Any] = {}
+
+    class FakeMotrixBackend:
+        def __init__(
+            self,
+            scene: SceneCfg,
+            num_envs: int,
+            sim_dt: float,
+            **kwargs: Any,
+        ) -> None:
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        backend_factory,
+        "_load_motrix_backend",
+        lambda: (FakeMotrixBackend, True),
+    )
+    gains = {"kp": 6.0, "kd": 0.25, "actuator_ids": slice(0, 16)}
+
+    backend_factory.create_backend(
+        "motrix",
+        SceneCfg(model_file="model.xml"),
+        num_envs=1,
+        sim_dt=0.01,
+        position_actuator_gains=gains,
+    )
+
+    assert captured["kwargs"]["position_actuator_gains"] == gains
+
+
 def test_create_backend_does_not_route_motrix_option_to_mujoco(monkeypatch) -> None:
     import unilab.base.backend as backend_factory
     from unilab.base.scene import SceneCfg

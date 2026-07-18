@@ -109,6 +109,26 @@ def _attach_motrix_scene_fragment(world: World, fragment_file: Path) -> None:
     world.attach(fragment)
 
 
+def _attach_motrix_fragment_keyframes(world: World, fragment_files: Sequence[Path]) -> None:
+    """Attach fragment keyframes after fragment bodies have expanded the model DOFs."""
+    import motrixsim.msd as msd
+
+    for fragment_file in fragment_files:
+        root = ET.parse(fragment_file).getroot()
+        for element in root.findall("./keyframe/key"):
+            keyframe = msd.Keyframe()
+            keyframe.name = element.get("name", "")
+            if element.get("time") is not None:
+                keyframe.time = float(element.get("time", "0"))
+            if element.get("qpos") is not None:
+                keyframe.dof_pos = [float(value) for value in element.get("qpos", "").split()]
+            if element.get("qvel") is not None:
+                keyframe.dof_vel = [float(value) for value in element.get("qvel", "").split()]
+            if element.get("ctrl") is not None:
+                keyframe.ctrl = [float(value) for value in element.get("ctrl", "").split()]
+            world.keyframes.append(keyframe)
+
+
 def _iter_motrix_links(link: Link):
     yield link
     for child in link.children:
@@ -168,16 +188,13 @@ def materialize_motrix_scene(
     fragment_paths = [
         _resolve_scene_fragment_path(fragment_file, model_path) for fragment_file in fragment_files
     ]
-    robot_path = _materialize_robot_with_fragment_keyframes(model_path, fragment_paths)
-    try:
-        world = msd.from_file(str(robot_path))
-        for fragment_path in fragment_paths:
-            _attach_motrix_scene_fragment(world, fragment_path)
-        if add_body_sensors:
-            add_motrix_tracking_frame_sensors(world, base_name=base_name)
-        return msd.build(world)
-    finally:
-        _cleanup_temp_xml(robot_path, model_path)
+    world = msd.from_file(str(model_path))
+    for fragment_path in fragment_paths:
+        _attach_motrix_scene_fragment(world, fragment_path)
+    _attach_motrix_fragment_keyframes(world, fragment_paths)
+    if add_body_sensors:
+        add_motrix_tracking_frame_sensors(world, base_name=base_name)
+    return msd.build(world)
 
 
 @overload
