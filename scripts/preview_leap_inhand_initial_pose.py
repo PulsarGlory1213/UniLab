@@ -38,7 +38,7 @@ def main() -> int:
         cfg = compose(
             config_name="config",
             overrides=[
-                "task=leap_inhand/motrix",
+                "task=leap_inhand/mujoco",
                 "env.gen_grasp=true",
                 "env.domain_rand.joint_noise=0.0",
                 "env.domain_rand.ball_vel_noise=0.0",

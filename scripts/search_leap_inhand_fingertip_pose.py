@@ -71,7 +71,7 @@ def main() -> int:
     )
     lower = np.maximum(lower, model_lower)
     upper = np.minimum(upper, model_upper)
-    ball = np.array([0.001, 0.028, 0.6250])
+    ball = np.array([-0.013583, -0.002142, 0.633196],dtype=np.float64,)
     # Seed from a natural flexion pattern, not the former palm-catch cache.
     center = np.array(
         [
