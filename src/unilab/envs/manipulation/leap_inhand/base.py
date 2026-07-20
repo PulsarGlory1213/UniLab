@@ -27,6 +27,8 @@ class ControlConfig:
     action_scale: float = 1.0 / 24.0
     kp: float = 1.0
     kd: float = 0.1
+    target_mode: str = "incremental"
+    target_offset_limit: float = 0.35
 
 
 @dataclass
@@ -107,14 +109,43 @@ class LeapHandBaseEnv(NpEnv):
         )
         state.info["current_actions"] = clipped_actions
 
-        prev_ctrl = state.info.get(
-            "prev_ctrl",
-            np.broadcast_to(
-                self.default_angles, (clipped_actions.shape[0], self._num_action)
-            ).copy(),
-        )
-        new_ctrl = prev_ctrl + self._cfg.control_config.action_scale * clipped_actions
-        new_ctrl = np.clip(new_ctrl, self._ctrl_lower, self._ctrl_upper)
+        target_mode = getattr(self._cfg.control_config, "target_mode", "incremental")
+        if target_mode in {"incremental", "bounded_incremental"}:
+            reference = state.info.get(
+                "prev_ctrl",
+                np.broadcast_to(
+                    self.default_angles, (clipped_actions.shape[0], self._num_action)
+                ).copy(),
+            )
+        elif target_mode == "default_offset":
+            reference = state.info.get(
+                "init_pose",
+                np.broadcast_to(
+                    self.default_angles, (clipped_actions.shape[0], self._num_action)
+                ).copy(),
+            )
+        else:
+            raise ValueError(
+                "control_config.target_mode must be 'incremental', 'bounded_incremental', "
+                f"or 'default_offset', got {target_mode!r}"
+            )
+
+        new_ctrl = reference + self._cfg.control_config.action_scale * clipped_actions
+        if target_mode == "bounded_incremental":
+            offset_limit = float(self._cfg.control_config.target_offset_limit)
+            if offset_limit <= 0.0:
+                raise ValueError("control_config.target_offset_limit must be positive")
+            center = state.info.get(
+                "init_pose",
+                np.broadcast_to(
+                    self.default_angles, (clipped_actions.shape[0], self._num_action)
+                ),
+            )
+            lower = np.maximum(self._ctrl_lower, center - offset_limit)
+            upper = np.minimum(self._ctrl_upper, center + offset_limit)
+            new_ctrl = np.clip(new_ctrl, lower, upper)
+        else:
+            new_ctrl = np.clip(new_ctrl, self._ctrl_lower, self._ctrl_upper)
         prev_ctrl = np.asarray(new_ctrl, dtype=self._np_dtype)
         state.info["prev_ctrl"] = prev_ctrl
         return prev_ctrl

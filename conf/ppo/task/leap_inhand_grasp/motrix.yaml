@@ -41,7 +41,7 @@ reward:
     drop: 0.0
   angvel_clip_min: -0.5
   angvel_clip_max: 0.5
-  reset_z_threshold: 0.58
+  reset_z_threshold: 0.54
 env:
   gen_grasp: true
   max_episode_seconds: 3.0
@@ -49,11 +49,14 @@ env:
   grasp_collection_target: 20000
   grasp_auto_save: true
   grasp_quality_check: true
-  grasp_min_contacts: 4
-  grasp_pad_target_distances: [0.036, 0.039, 0.050, 0.040]
-  grasp_pad_surface_tolerance: 0.004
-  grasp_pad_alignment_minimums: [0.65, 0.65, 0.25, 0.65]
-  grasp_opposition_dot_max: -0.20
+  # Match Allegro contact semantics; fingertip proximity and palm rejection remain LEAP-specific.
+  grasp_min_contacts: 2
+  grasp_contact_mask_quota: 2500
+  grasp_warmup_seconds: 0.5
+  grasp_pad_target_distances: [0.036, 0.039, 0.050, 0.042]
+  grasp_pad_surface_tolerance: 0.010
+  grasp_pad_alignment_minimums: [0.20, 0.20, 0.00, 0.20]
+  grasp_opposition_dot_max: 0.0
   rotation_axis: [0.0, 0.0, 1.0]
   ctrl_dt: 0.02
   control_config:
@@ -65,7 +68,7 @@ env:
     random_com: false
     randomize_gravity: false
     push_robots: false
-    joint_noise: 0.10
+    joint_noise: 0.03
     ball_vel_noise: 0.0
     ball_z_offset: 0.0
 play_profile:

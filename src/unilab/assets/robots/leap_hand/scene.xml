@@ -23,7 +23,7 @@
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
     <geom name="floor" pos="0 0 0" size="0 0 0.05" type="plane"
           material="rotation_ground"/>
-    <body name="ball" pos="-0.03 0.03 0.62">
+    <body name="ball" pos="-0.013583 -0.002142 0.633196">
       <freejoint name="ball_joint"/>
       <geom name="ball" type="sphere" size="0.0335" mass="0.05" condim="6"
             friction="2.0 0.05 0.01" solimp="0.95 0.99 0.001" solref="0.01 1"
@@ -41,7 +41,7 @@
              geom2="ball" data="found" num="1" reduce="mindist"/>
     <contact name="leap_rotation_palm_contact" geom1="palm_lower_collision"
              geom2="ball" data="found" num="1" reduce="mindist"/>
-    <!-- 指腹位置與法向供 LEAP cache 品質檢查；兩個 backend 使用相同 sensor contract。 -->
+    <!-- Pad pose sensors are shared by LEAP cache diagnostics on both backends. -->
     <framepos name="leap_rotation_ff_pad_pos" objtype="site" objname="ff_pad_center"/>
     <framepos name="leap_rotation_ff_pad_normal_pos" objtype="site" objname="ff_pad_normal"/>
     <framepos name="leap_rotation_mf_pad_pos" objtype="site" objname="mf_pad_center"/>
@@ -53,7 +53,7 @@
   </sensor>
   <keyframe>
     <key name="home"
-      qpos="0.949845 -0.281626 1.186686 0.414096 1.630650 -1.030395 0.181375 1.643892 1.702207 -1.047000 -0.506000 -0.366000 1.767081 1.188725 0.657915 0.291346 -0.03 0.03 0.62 1 0 0 0"
-      ctrl="0.949845 -0.281626 1.186686 0.414096 1.630650 -1.030395 0.181375 1.643892 1.702207 -1.047000 -0.506000 -0.366000 1.767081 1.188725 0.657915 0.291346"/>
+      qpos="1.205147 -0.605767 0.230668 0.681022 0.746191 -0.097833 0.936544 0.076832 1.477715 -0.450996 -0.013916 0.105753 1.695646 0.269985 0.360451 -0.071177 -0.013583 -0.002142 0.633196 0.994792 0.085251 0.044022 0.034399"
+      ctrl="1.205147 -0.605767 0.230668 0.681022 0.746191 -0.097833 0.936544 0.076832 1.477715 -0.450996 -0.013916 0.105753 1.695646 0.269985 0.360451 -0.071177"/>
   </keyframe>
 </mujoco>

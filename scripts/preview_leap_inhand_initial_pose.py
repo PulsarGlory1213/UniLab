@@ -23,6 +23,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--output-video", type=Path, default=None)
     parser.add_argument(
         "--simulate",
         action="store_true",
@@ -65,9 +66,9 @@ def main() -> int:
 
     try:
         env.run_playback_mode(
-            play_render_mode="interactive",
+            play_render_mode="record" if args.output_video is not None else "interactive",
             play_steps=args.steps,
-            output_video=None,
+            output_video=str(args.output_video) if args.output_video is not None else None,
             render_spacing=float(cfg.training.render_spacing),
             initialize=initialize,
             step=step,

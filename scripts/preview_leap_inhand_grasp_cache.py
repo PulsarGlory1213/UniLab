@@ -48,7 +48,8 @@ def main() -> int:
             overrides=[
                 "task=leap_inhand/motrix",
                 f"training.play_env_num={args.num_envs}",
-                "env.grasp_cache_sample_mode=sequential",
+                "+env.grasp_cache_sample_mode=sequential",
+                "+env.use_grasp_cache=true",
                 f"env.grasp_cache_start_index={args.start_index}",
                 "env.domain_rand.ball_vel_noise=0.0",
             ],

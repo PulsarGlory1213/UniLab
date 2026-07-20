@@ -56,7 +56,7 @@
               <geom name="fingertip_collision" pos="0.013286424108533503169 -0.0061142383865419869249 0.014499999999999497666" quat="0 1 0 0" type="mesh" mesh="fingertip_collision_fingertip" class="index_collision" />
               <geom name="fingertip_visual" pos="0.013286424108533503169 -0.0061142383865419869249 0.014499999999999497666" quat="0 1 0 0" type="mesh" mesh="fingertip_fingertip" material="mcp_joint_material" class="visual" />
               <site name="ff_pad_center" pos="0 -0.025 0.030" size="0.001" rgba="0 0 0 0" />
-              <site name="ff_pad_normal" pos="0 -0.025 0.040" size="0.001" rgba="0 0 0 0" />
+              <site name="ff_pad_normal" pos="0 -0.025 0.020" size="0.001" rgba="0 0 0 0" />
             </body>
           </body>
         </body>
@@ -82,7 +82,7 @@
               <geom name="fingertip_2_collision" pos="0.01328642410853349623 -0.0061142383865420008027 0.014499999999999495931" quat="0 1 0 0" type="mesh" mesh="fingertip_collision_fingertip" class="middle_collision" />
               <geom name="fingertip_2_visual" pos="0.01328642410853349623 -0.0061142383865420008027 0.014499999999999495931" quat="0 1 0 0" type="mesh" mesh="fingertip_fingertip" material="mcp_joint_material" class="visual" />
               <site name="mf_pad_center" pos="0 -0.025 0.030" size="0.001" rgba="0 0 0 0" />
-              <site name="mf_pad_normal" pos="0 -0.025 0.040" size="0.001" rgba="0 0 0 0" />
+              <site name="mf_pad_normal" pos="0 -0.025 0.020" size="0.001" rgba="0 0 0 0" />
             </body>
           </body>
         </body>
@@ -108,7 +108,7 @@
               <geom name="fingertip_3_collision" pos="0.013286424108533501434 -0.0061142383865419869249 0.0144999999999994994" quat="0 1 0 0" type="mesh" mesh="fingertip_collision_fingertip" class="ring_collision" />
               <geom name="fingertip_3_visual" pos="0.013286424108533501434 -0.0061142383865419869249 0.0144999999999994994" quat="0 1 0 0" type="mesh" mesh="fingertip_fingertip" material="mcp_joint_material" class="visual" />
               <site name="rf_pad_center" pos="0 -0.025 0.030" size="0.001" rgba="0 0 0 0" />
-              <site name="rf_pad_normal" pos="0 -0.025 0.040" size="0.001" rgba="0 0 0 0" />
+              <site name="rf_pad_normal" pos="0 -0.025 0.020" size="0.001" rgba="0 0 0 0" />
             </body>
           </body>
         </body>

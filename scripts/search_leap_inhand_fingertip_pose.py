@@ -14,6 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 ASSET_DIR = ROOT / "src" / "unilab" / "assets" / "robots" / "leap_hand"
 PAD_SITES = ("ff_pad_center", "mf_pad_center", "rf_pad_center", "th_pad_center")
 NORMAL_SITES = ("ff_pad_normal", "mf_pad_normal", "rf_pad_normal", "th_pad_normal")
+TIP_GEOMS = (
+    "fingertip_collision",
+    "fingertip_2_collision",
+    "fingertip_3_collision",
+    "thumb_fingertip_collision",
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -21,6 +27,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=200_000)
     parser.add_argument("--rounds", type=int, default=8)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--allegro-layout", action="store_true")
     return parser.parse_args()
 
 
@@ -43,6 +50,13 @@ def main() -> int:
     normal_ids = np.array(
         [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name) for name in NORMAL_SITES]
     )
+    tip_geom_ids = np.array(
+        [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in TIP_GEOMS]
+    )
+    ball_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "ball")
+    palm_geom_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_GEOM, "palm_lower_collision"
+    )
     model_lower = model.jnt_range[:16, 0].copy()
     model_upper = model.jnt_range[:16, 1].copy()
     # Stay in a human-readable inward-curl family. In particular, do not let
@@ -57,19 +71,81 @@ def main() -> int:
     )
     lower = np.maximum(lower, model_lower)
     upper = np.minimum(upper, model_upper)
-    ball = np.array([-0.01, 0.045, 0.6245])
-    radius = 0.0335
+    ball = np.array([0.001, 0.028, 0.6250])
     # Seed from a natural flexion pattern, not the former palm-catch cache.
     center = np.array(
         [
-            1.244, 0.082, 0.265, 0.298,
-            1.096, 0.005, 0.080, 0.150,
-            1.337, 0.029, 0.285, 0.317,
-            1.104, 1.163, 0.953, -0.138,
+            0.710557, 0.720452, 0.720249, -0.330859,
+            0.789181, 0.740685, 0.601233, 0.543166,
+            1.208433, -0.034896, 0.719992, 0.083205,
+            1.192924, 0.939653, 1.205634, 0.243515,
         ],
         dtype=np.float64,
     )
     rng = np.random.default_rng(args.seed)
+
+    if args.allegro_layout:
+        # Allegro's authored home pose distributes the three main fingertips
+        # across one side of the ball and opposes them with the thumb. Solve
+        # LEAP's independent finger chains against the actual pad sites.
+        allegro_directions = np.array(
+            [
+                [-0.6810, -0.3686, -0.6327],
+                [0.1441, -0.6999, -0.6995],
+                [0.7841, -0.2288, -0.5769],
+                [-0.1064, 0.7907, -0.6029],
+            ],
+            dtype=np.float64,
+        )
+        allegro_directions /= np.linalg.norm(allegro_directions, axis=1, keepdims=True)
+        pad_radii = np.array([0.039, 0.039, 0.039, 0.040], dtype=np.float64)
+        pad_targets = ball[None, :] + pad_radii[:, None] * allegro_directions
+        solved = np.clip(center, lower, upper)
+        finger_slices = (slice(0, 4), slice(4, 8), slice(8, 12), slice(12, 16))
+        for finger_index, finger_slice in enumerate(finger_slices):
+            target = pad_targets[finger_index]
+
+            def finger_score(finger_qpos: np.ndarray) -> float:
+                candidate = solved.copy()
+                candidate[finger_slice] = finger_qpos
+                data.qpos[:16] = candidate
+                data.qpos[16:19] = ball
+                data.qpos[19:23] = (1.0, 0.0, 0.0, 0.0)
+                mujoco.mj_forward(model, data)
+                pad = data.site_xpos[pad_ids[finger_index]]
+                normal = data.site_xpos[normal_ids[finger_index]] - pad
+                normal /= max(np.linalg.norm(normal), 1e-9)
+                target_normal = -allegro_directions[finger_index]
+                position_error = np.sum(np.square((pad - target) / 0.003))
+                normal_error = np.square(
+                    max(0.75 - np.dot(normal, target_normal), 0.0) / 0.15
+                )
+                return float(position_error + 2.0 * normal_error)
+
+            finger_lower = lower[finger_slice]
+            finger_upper = upper[finger_slice]
+            finger_best = solved[finger_slice].copy()
+            finger_best_score = finger_score(finger_best)
+            finger_sigma = 0.35 * (finger_upper - finger_lower)
+            finger_rng = np.random.default_rng(args.seed + finger_index)
+            for ik_round in range(8):
+                if ik_round == 0:
+                    candidates = finger_rng.uniform(finger_lower, finger_upper, size=(8000, 4))
+                else:
+                    candidates = finger_best + finger_rng.normal(size=(8000, 4)) * finger_sigma
+                    candidates = np.clip(candidates, finger_lower, finger_upper)
+                for candidate in candidates:
+                    candidate_score = finger_score(candidate)
+                    if candidate_score < finger_best_score:
+                        finger_best_score = candidate_score
+                        finger_best = candidate.copy()
+                finger_sigma *= 0.48
+            solved[finger_slice] = finger_best
+            print(
+                f"finger={finger_index} ik_score={finger_best_score:.6f} "
+                f"qpos={np.round(finger_best, 6).tolist()}"
+            )
+        center = solved
 
     def score(qpos: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
         data.qpos[:16] = qpos
@@ -83,8 +159,29 @@ def main() -> int:
         distances = np.linalg.norm(to_ball, axis=1)
         directions = to_ball / np.maximum(distances[:, None], 1e-9)
         alignment = np.sum(normals * directions, axis=1)
-        surface = np.square((distances - radius) / 0.004).sum()
-        facing = np.square(np.minimum(alignment - 0.72, 0.0) / 0.18).sum()
+        pad_targets = np.array([0.036, 0.039, 0.050, 0.040], dtype=np.float64)
+        alignment_targets = np.array([0.20, 0.20, 0.00, 0.20], dtype=np.float64)
+        surface = np.square((distances - pad_targets) / 0.010).sum()
+        facing = np.square(np.minimum(alignment - alignment_targets, 0.0) / 0.20).sum()
+
+        tip_ball_distance = np.array(
+            [
+                mujoco.mj_geomDistance(
+                    model, data, int(tip_id), int(ball_geom_id), 0.2, None
+                )
+                for tip_id in tip_geom_ids
+            ]
+        )
+        contact_gap = np.square(
+            np.maximum(tip_ball_distance - 0.0015, 0.0) / 0.008
+        ).sum()
+        contact_penetration = np.square(
+            np.maximum(-tip_ball_distance - 0.002, 0.0) / 0.003
+        ).sum()
+        palm_distance = mujoco.mj_geomDistance(
+            model, data, int(palm_geom_id), int(ball_geom_id), 0.2, None
+        )
+        palm_penalty = np.square(max(0.004 - palm_distance, 0.0) / 0.004)
         # Keep the three main fingertips fanned instead of stacked together.
         separation = 0.0
         for first in range(3):
@@ -111,7 +208,17 @@ def main() -> int:
             }
             if "ball" in geom_names and contact.dist < -0.002:
                 penetration += float(np.square((-contact.dist - 0.002) / 0.003))
-        score_value = surface + 4.0 * facing + separation + limit + spread + 3.0 * opposition
+        score_value = (
+            surface
+            + 12.0 * facing
+            + separation
+            + limit
+            + spread
+            + 2.0 * opposition
+            + 10.0 * contact_gap
+            + 10.0 * contact_penetration
+            + 12.0 * palm_penalty
+        )
         return float(score_value + 8.0 * penetration), distances, alignment
 
     best_score, best_dist, best_alignment = score(center)

@@ -1,7 +1,4 @@
-"""LEAP Hand 旋轉任務的獨立 grasp-cache 產生器。
-
-候選姿勢必須通過指腹距離、指腹朝向、拇指對向接觸與物理存活檢查。
-"""
+"""Backend-independent grasp-cache collector for LEAP in-hand rotation."""
 
 from __future__ import annotations
 
@@ -17,12 +14,16 @@ from unilab.base.np_env import NpEnvState
 from .rotation import LeapInhandRotationCfg, LeapInhandRotationEnv, RewardConfigPPO
 
 
+def grasp_warmup_steps(warmup_seconds: float, ctrl_dt: float) -> int:
+    """Convert the backend-independent warmup duration to control steps."""
+    return max(1, int(round(float(warmup_seconds) / float(ctrl_dt))))
+
+
 @registry.envcfg("LeapInhandRotationGrasp")
 @dataclass
 class LeapInhandRotationGraspCfg(LeapInhandRotationCfg):
-    # These are fallback defaults. Hydra task env overrides (e.g.
-    # conf/ppo/task/allegro_inhand_grasp/mujoco.yaml and CLI env.*)
-    # are applied at env construction and take precedence.
+    # These are fallback defaults. Hydra LEAP grasp-task and CLI env.*
+    # overrides are applied at construction and take precedence.
     max_episode_seconds: float = 2.0
     reward_config: RewardConfigPPO = field(
         default_factory=lambda: RewardConfigPPO(
@@ -36,20 +37,21 @@ class LeapInhandRotationGraspCfg(LeapInhandRotationCfg):
             },
             angvel_clip_min=-0.5,
             angvel_clip_max=0.5,
-            reset_z_threshold=0.125,
+            reset_z_threshold=0.54,
         )
     )
     gen_grasp: bool = True
     grasp_collection_target: int = 20_000
     grasp_auto_save: bool = True
     grasp_quality_check: bool = True
-    grasp_min_contacts: int = 4
-    # 四個 pad site 到球心的校正距離；不同 mesh 的 site 深度並不相同。
-    grasp_pad_target_distances: tuple[float, ...] = (0.036, 0.039, 0.050, 0.040)
-    grasp_pad_surface_tolerance: float = 0.004
-    # 無名指受 LEAP 機械極限影響，指尖接觸可行但 site 法向較保守。
-    grasp_pad_alignment_minimums: tuple[float, ...] = (0.65, 0.65, 0.25, 0.65)
-    grasp_opposition_dot_max: float = -0.20
+    # Match Allegro: require support contact while keeping every fingertip within reach.
+    grasp_min_contacts: int = 2
+    grasp_contact_mask_quota: int = 2500
+    grasp_warmup_seconds: float = 0.5
+    grasp_pad_target_distances: tuple[float, ...] = (0.036, 0.039, 0.050, 0.042)
+    grasp_pad_surface_tolerance: float = 0.010
+    grasp_pad_alignment_minimums: tuple[float, ...] = (0.20, 0.20, 0.00, 0.20)
+    grasp_opposition_dot_max: float = 0.0
 
 
 @registry.env("LeapInhandRotationGrasp", sim_backend="mujoco")
@@ -76,6 +78,7 @@ class LeapInhandRotationGrasp(LeapInhandRotationEnv):
     ) -> None:
         super().__init__(cfg, num_envs=num_envs, backend_type=backend_type)
         self._saved_grasping_states: list[np.ndarray] = []
+        self._contact_mask_counts: dict[int, int] = {}
         self._grasp_cache_saved = False
         self._grasp_target_reached_notified = False
 
@@ -91,23 +94,27 @@ class LeapInhandRotationGrasp(LeapInhandRotationEnv):
             return sensor_data
         return sensor_data.reshape(sensor_data.shape[0], -1)[:, 0]
 
-    def _contact_count(self) -> np.ndarray:
+    def _finger_contacts(self) -> np.ndarray:
+        """Return [index, middle, ring, thumb] contact flags for every environment."""
         contacts = np.stack(
             [self._sensor_scalar(self.get_sensor_data(name)) for name in self._CONTACT_SENSORS],
             axis=1,
         )
-        return np.asarray(np.sum(contacts > 0.5, axis=1), dtype=np.int32)
+        return np.asarray(contacts > 0.5, dtype=bool)
+
+    def _contact_count(self) -> np.ndarray:
+        return np.asarray(np.sum(self._finger_contacts(), axis=1), dtype=np.int32)
 
     @staticmethod
     def _sensor_vector(sensor_data: np.ndarray) -> np.ndarray:
-        """把 backend sensor 統一整理成 [num_envs, 3]。"""
+        """Normalize a backend sensor array to [num_envs, 3]."""
         sensor_data = np.asarray(sensor_data)
         return sensor_data.reshape(sensor_data.shape[0], -1)[:, :3]
 
     def _pad_geometry(
         self, ball_pos: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """計算四個指腹到球面的誤差、朝向球心程度與對向夾持程度。"""
+        """Measure pad-to-ball distance, pad normal alignment, and thumb opposition."""
         pad_pos = np.stack(
             [self._sensor_vector(self.get_sensor_data(name)) for name in self._PAD_POSITION_SENSORS],
             axis=1,
@@ -124,12 +131,15 @@ class LeapInhandRotationGrasp(LeapInhandRotationEnv):
         target_distances = np.asarray(
             self._cfg.grasp_pad_target_distances, dtype=self._np_dtype
         )
-        if target_distances.shape != (4,):
-            raise ValueError("grasp_pad_target_distances must contain four values")
+        alignment_minimums = np.asarray(
+            self._cfg.grasp_pad_alignment_minimums, dtype=self._np_dtype
+        )
+        if target_distances.shape != (4,) or alignment_minimums.shape != (4,):
+            raise ValueError("LEAP pad targets and alignment minimums must contain four values")
+
         surface_error = np.abs(distance - target_distances[None, :])
         alignment = np.sum(pad_normal * (to_ball / distance[:, :, None]), axis=2)
 
-        # 大拇指必須位於三根主手指的對側，而不是和食指交叉在同一側。
         main_side = np.mean(pad_pos[:, :3, :] - ball_pos[:, None, :], axis=1)
         thumb_side = pad_pos[:, 3, :] - ball_pos
         main_side /= np.maximum(np.linalg.norm(main_side, axis=1, keepdims=True), 1e-6)
@@ -138,26 +148,20 @@ class LeapInhandRotationGrasp(LeapInhandRotationEnv):
         return surface_error, alignment, opposition_dot
 
     def _compute_grasp_conditions(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """LEAP cache 必須是四指指腹包球，而不只是任意 link 碰撞。"""
+        """Apply Allegro-style proximity plus stricter LEAP contact and height gates."""
         ball_pos = self.get_ball_pos()
-        surface_error, alignment, opposition_dot = self._pad_geometry(ball_pos)
-
-        pad_geometry_ok = np.all(
-            (surface_error <= float(self._cfg.grasp_pad_surface_tolerance))
-            & (
-                alignment
-                >= np.asarray(self._cfg.grasp_pad_alignment_minimums, dtype=self._np_dtype)[
-                    None, :
-                ]
-            ),
-            axis=1,
+        fingertip_distance = np.linalg.norm(
+            self.get_fingertip_pos() - ball_pos[:, None, :], axis=2
         )
+        fingertips_near_ball = np.all(fingertip_distance < 0.1, axis=1)
         contact_ok = self._contact_count() >= int(self._cfg.grasp_min_contacts)
-        opposition_ok = opposition_dot <= float(self._cfg.grasp_opposition_dot_max)
+        palm_contact = self._sensor_scalar(
+            self.get_sensor_data("leap_rotation_palm_contact")
+        ) > 0.5
         object_high_enough = ball_pos[:, 2] > float(self._reward_cfg.reset_z_threshold)
         return (
-            np.asarray(pad_geometry_ok, dtype=bool),
-            np.asarray(contact_ok & opposition_ok, dtype=bool),
+            np.asarray(fingertips_near_ball, dtype=bool),
+            np.asarray(contact_ok & (~palm_contact), dtype=bool),
             np.asarray(object_high_enough, dtype=bool),
         )
 
@@ -240,6 +244,25 @@ class LeapInhandRotationGrasp(LeapInhandRotationEnv):
         if success_env_ids.size == 0:
             return
 
+        contacts = self._finger_contacts()[success_env_ids]
+        contact_masks = np.sum(
+            contacts.astype(np.int32) * (1 << np.arange(4, dtype=np.int32))[None, :],
+            axis=1,
+        )
+        quota = int(self._cfg.grasp_contact_mask_quota)
+        if quota > 0:
+            keep_indices: list[int] = []
+            for local_index, contact_mask in enumerate(contact_masks.tolist()):
+                saved_for_mask = self._contact_mask_counts.get(int(contact_mask), 0)
+                if saved_for_mask >= quota:
+                    continue
+                self._contact_mask_counts[int(contact_mask)] = saved_for_mask + 1
+                keep_indices.append(local_index)
+            success_env_ids = success_env_ids[np.asarray(keep_indices, dtype=np.int64)]
+
+        if success_env_ids.size == 0:
+            return
+
         curr_dof_pos = np.asarray(self.state.info.get("curr_dof_pos", self.get_hand_dof_pos()))
         curr_ball_pos = np.asarray(self.state.info.get("curr_ball_pos", self.get_ball_pos()))
         curr_ball_quat = np.asarray(self.state.info.get("curr_ball_quat", self.get_ball_quat()))
@@ -263,20 +286,29 @@ class LeapInhandRotationGrasp(LeapInhandRotationEnv):
         reward = np.zeros((self._num_envs,), dtype=self._np_dtype)
 
         cond1, cond2, cond3 = self._compute_grasp_conditions()
+        step_count = next_state.info.get("steps", np.zeros((self._num_envs,), dtype=np.uint32))
+        warmup = grasp_warmup_steps(
+            float(self._cfg.grasp_warmup_seconds), float(self._cfg.ctrl_dt)
+        )
+        ready_to_check = step_count >= warmup
+
         if self._cfg.grasp_quality_check:
             grasp_valid = cond1 & cond2 & cond3
-            terminated = np.asarray(next_state.terminated | (~grasp_valid), dtype=bool)
+            terminated = np.asarray(
+                next_state.terminated | (ready_to_check & (~grasp_valid)),
+                dtype=bool,
+            )
         else:
             grasp_valid = np.ones((self._num_envs,), dtype=bool)
             terminated = np.asarray(next_state.terminated, dtype=bool)
 
-        step_count = next_state.info.get("steps", np.zeros((self._num_envs,), dtype=np.uint32))
         should_log = self._enable_reward_log and (int(step_count[0]) % 4 == 0)
         if should_log:
             log = next_state.info.get("log", {})
             log["grasp/cond1"] = float(np.mean(cond1.astype(np.float32)))
             log["grasp/cond2"] = float(np.mean(cond2.astype(np.float32)))
             log["grasp/cond3"] = float(np.mean(cond3.astype(np.float32)))
+            log["grasp/warmup_ready"] = float(np.mean(ready_to_check.astype(np.float32)))
             log["grasp/valid"] = float(np.mean(grasp_valid.astype(np.float32)))
             log["grasp/cache_size"] = float(self._total_saved_grasps())
             next_state.info["log"] = log

@@ -89,12 +89,27 @@ def sample_cached_grasps(
     return sampled[:, :16], sampled[:, 16:19], sampled[:, 19:23]
 
 
+def validate_grasp_cache(grasp_cache: np.ndarray, source: str = "<memory>") -> np.ndarray:
+    """Validate the LEAP cache contract: 16 hand joints + 3 position + 4 quaternion."""
+    cache = np.asarray(grasp_cache)
+    if cache.ndim != 2 or cache.shape[1] != 23:
+        raise ValueError(
+            f"Invalid LEAP grasp cache {source}: expected shape (N, 23), got {cache.shape}"
+        )
+    if cache.shape[0] == 0:
+        raise ValueError(f"Invalid LEAP grasp cache {source}: the cache is empty")
+    if not np.all(np.isfinite(cache)):
+        raise ValueError(f"Invalid LEAP grasp cache {source}: values must all be finite")
+    return cache.astype(np.float64, copy=False)
+
+
 @dataclass
 class RewardConfigPPO:
     scales: dict[str, float]
     angvel_clip_min: float
     angvel_clip_max: float
     reset_z_threshold: float
+    rotation_warmup_seconds: float = 0.0
 
 
 @dataclass
@@ -131,7 +146,11 @@ class LeapInhandRotationCfg(LeapHandBaseCfg):
     reward_config: RewardConfigPPO | None = None
     domain_rand: DomainRandConfig = field(default_factory=DomainRandConfig)
     rotation_axis: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    rotation_cycle_seconds: float = 2.0
     grasp_cache_path: str = "caches/leap_hand_allegro_style_20k.npy"
+    use_grasp_cache: bool = True
+    grasp_cache_sample_mode: str = "random"
+    grasp_cache_start_index: int = 0
     gen_grasp: bool = False
 
 
@@ -149,7 +168,7 @@ class LeapRotationDomainRandomizationProvider(DomainRandomizationProvider):
     def _load_grasp_cache(self, env: Any) -> np.ndarray | None:
         if env._grasp_cache_loaded:
             return cast(np.ndarray | None, env._grasp_cache)
-        if env.cfg.gen_grasp:
+        if env.cfg.gen_grasp or not env.cfg.use_grasp_cache:
             env._grasp_cache = None
             env._grasp_cache_loaded = True
             return None
@@ -166,7 +185,7 @@ class LeapRotationDomainRandomizationProvider(DomainRandomizationProvider):
             env._grasp_cache = None
             env._grasp_cache_loaded = True
             return None
-        env._grasp_cache = np.load(cache_path).astype(np.float64)
+        env._grasp_cache = validate_grasp_cache(np.load(cache_path), str(cache_path))
         env._grasp_cache_loaded = True
         print(
             "[leap_inhand] Loaded grasp cache: "
@@ -180,7 +199,24 @@ class LeapRotationDomainRandomizationProvider(DomainRandomizationProvider):
         dr = env.cfg.domain_rand
         grasp_cache = self._load_grasp_cache(env)
         if grasp_cache is not None:
-            hand_qpos, ball_pos, ball_quat = sample_cached_grasps(grasp_cache, num_reset)
+            sample_mode = str(env.cfg.grasp_cache_sample_mode)
+            if sample_mode == "random":
+                hand_qpos, ball_pos, ball_quat = sample_cached_grasps(grasp_cache, num_reset)
+            elif sample_mode == "sequential":
+                start = int(env._grasp_cache_cursor)
+                indices = (start + np.arange(num_reset, dtype=np.int64)) % len(grasp_cache)
+                sampled = grasp_cache[indices]
+                hand_qpos, ball_pos, ball_quat = (
+                    sampled[:, :16],
+                    sampled[:, 16:19],
+                    sampled[:, 19:23],
+                )
+                env._grasp_cache_cursor = (start + num_reset) % len(grasp_cache)
+            else:
+                raise ValueError(
+                    "grasp_cache_sample_mode must be 'random' or 'sequential', "
+                    f"got {sample_mode!r}"
+                )
         else:
             hand_qpos = np.broadcast_to(env.default_angles, (num_reset, env._NUM_HAND_DOF)).copy()
             hand_qpos += np.random.uniform(-dr.joint_noise, dr.joint_noise, hand_qpos.shape).astype(
@@ -226,6 +262,9 @@ class LeapRotationDomainRandomizationProvider(DomainRandomizationProvider):
             "prev_ball_quat": np.asarray(ball_quat, dtype=dtype).copy(),
             "prev_ball_linvel": np.zeros((num_reset, 3), dtype=dtype),
             "prev_ball_angvel": np.zeros((num_reset, 3), dtype=dtype),
+            "curr_fingertip_contacts": np.zeros(
+                (num_reset, len(env._CONTACT_SENSORS)), dtype=dtype
+            ),
         }
         init_obs = env._build_current_obs(info_updates, init_ctrl, init_ball_pos)
         info_updates["obs_lag_history"] = build_obs_lag_history(
@@ -276,10 +315,20 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
         "fingertip_3",
         "thumb_fingertip",
     )
+    _PALM_CONTACT_SENSOR = "leap_rotation_palm_contact"
+    _CONTACT_SENSORS = (
+        "leap_ff_contact",
+        "leap_mf_contact",
+        "leap_rf_contact",
+        "leap_th_contact",
+    )
     _reward_cfg: RewardConfigPPO
 
     # 每幀 = 16 joint positions + 16 targets + 3 ball position。
-    _NUM_OBS_PER_STEP = 35
+    _NUM_OBS_PER_STEP = 44
+    _INCLUDE_FINGERTIP_CONTACT_OBS = True
+    _INCLUDE_BALL_ANGVEL_OBS = True
+    _INCLUDE_ROTATION_PHASE_OBS = True
     # 疊三幀，讓 policy 能由歷史差分推斷運動趨勢。
     _NUM_LAG_STEPS = 3
 
@@ -312,6 +361,7 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
         self._rot_axis = normalize_rotation_axis(cfg.rotation_axis)
         self._grasp_cache: np.ndarray | None = None
         self._grasp_cache_loaded = False
+        self._grasp_cache_cursor = int(cfg.grasp_cache_start_index)
 
         self._init_reward_functions()
         self._init_domain_randomization(self._domain_randomization_provider())
@@ -324,9 +374,11 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
         return {"obs": self._NUM_OBS_PER_STEP * self._NUM_LAG_STEPS}
 
     def _init_reward_functions(self) -> None:
-        """註冊 YAML 可選用的六個 reward/penalty term。"""
+        """Register the reward terms selected by the owner YAML."""
         self._reward_fns = {
             "rotate": self._reward_rotate,
+            "reverse_rotate": self._reward_reverse_rotate,
+            "palm_contact": self._reward_palm_contact,
             "obj_linvel": self._reward_obj_linvel,
             "pose_diff": self._reward_pose_diff,
             "torque": self._reward_torque,
@@ -345,12 +397,69 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
         torques: np.ndarray,
         terminated: np.ndarray,
     ) -> np.ndarray:
-        del info, dof_pos, dof_vel, ball_pos, ball_linvel, torques, terminated
+        del dof_pos, dof_vel, ball_pos, ball_linvel, torques, terminated
+        warmup_steps = int(
+            round(float(getattr(self._reward_cfg, "rotation_warmup_seconds", 0.0)) / float(self._cfg.ctrl_dt))
+        )
         vec_dot = ball_angvel @ self._rot_axis
         reward: np.ndarray = np.clip(
             vec_dot, self._reward_cfg.angvel_clip_min, self._reward_cfg.angvel_clip_max
         )
+        if warmup_steps > 0:
+            step_count = np.asarray(
+                info.get("steps", np.zeros(reward.shape[0], dtype=np.uint32))
+            )
+            reward = np.where(step_count >= warmup_steps, reward, 0.0)
         return reward
+
+    def _reward_reverse_rotate(
+        self,
+        info: dict[str, Any],
+        dof_pos: np.ndarray,
+        dof_vel: np.ndarray,
+        ball_pos: np.ndarray,
+        ball_linvel: np.ndarray,
+        ball_angvel: np.ndarray,
+        torques: np.ndarray,
+        terminated: np.ndarray,
+    ) -> np.ndarray:
+        """Return only angular speed opposite to the configured rotation axis."""
+        del dof_pos, dof_vel, ball_pos, ball_linvel, torques, terminated
+        warmup_steps = int(
+            round(float(self._reward_cfg.rotation_warmup_seconds) / float(self._cfg.ctrl_dt))
+        )
+        penalty = np.clip(
+            -(ball_angvel @ self._rot_axis),
+            0.0,
+            max(0.0, -float(self._reward_cfg.angvel_clip_min)),
+        )
+        if warmup_steps > 0:
+            step_count = np.asarray(
+                info.get("steps", np.zeros(penalty.shape[0], dtype=np.uint32))
+            )
+            penalty = np.where(step_count >= warmup_steps, penalty, 0.0)
+        return np.asarray(penalty, dtype=get_global_dtype())
+    @staticmethod
+    def _contact_flag(sensor_data: np.ndarray) -> np.ndarray:
+        values = np.asarray(sensor_data)
+        return np.asarray(
+            values.reshape(values.shape[0], -1)[:, 0] > 0.5,
+            dtype=get_global_dtype(),
+        )
+
+    def _reward_palm_contact(
+        self,
+        info: dict[str, Any],
+        dof_pos: np.ndarray,
+        dof_vel: np.ndarray,
+        ball_pos: np.ndarray,
+        ball_linvel: np.ndarray,
+        ball_angvel: np.ndarray,
+        torques: np.ndarray,
+        terminated: np.ndarray,
+    ) -> np.ndarray:
+        del info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+        return self._contact_flag(self.get_sensor_data(self._PALM_CONTACT_SENSOR))
 
     def _reward_obj_linvel(
         self,
@@ -445,6 +554,11 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
         state.info["curr_ball_quat"] = ball_quat.copy()
         state.info["curr_ball_linvel"] = ball_linvel.copy()
         state.info["curr_ball_angvel"] = ball_angvel.copy()
+        if self._INCLUDE_FINGERTIP_CONTACT_OBS:
+            state.info["curr_fingertip_contacts"] = np.stack(
+                [self._contact_flag(self.get_sensor_data(name)) for name in self._CONTACT_SENSORS],
+                axis=1,
+            ).astype(get_global_dtype())
 
         state.info["prev_dof_pos"] = dof_pos.copy()
         state.info["prev_ball_pos"] = ball_pos.copy()
@@ -517,7 +631,35 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
                 * noise_cfg.scale_joint_angle
             )
 
-        return np.concatenate([dof_pos_norm, targets, ball_pos.astype(dtype)], axis=1, dtype=dtype)
+        obs_parts = [dof_pos_norm, targets, ball_pos.astype(dtype)]
+        if self._INCLUDE_FINGERTIP_CONTACT_OBS:
+            obs_parts.append(
+                np.asarray(
+                    info.get(
+                        "curr_fingertip_contacts",
+                        np.zeros((dof_pos.shape[0], len(self._CONTACT_SENSORS))),
+                    ),
+                    dtype=dtype,
+                )
+            )
+        if self._INCLUDE_BALL_ANGVEL_OBS:
+            obs_parts.append(
+                np.asarray(
+                    info.get("curr_ball_angvel", np.zeros_like(ball_pos)),
+                    dtype=dtype,
+                )
+            )
+        if self._INCLUDE_ROTATION_PHASE_OBS:
+            cycle_seconds = float(self._cfg.rotation_cycle_seconds)
+            if cycle_seconds <= 0.0:
+                raise ValueError("rotation_cycle_seconds must be positive")
+            step_count = np.asarray(
+                info.get("steps", np.zeros(dof_pos.shape[0], dtype=np.float32)),
+                dtype=dtype,
+            )
+            phase = 2.0 * np.pi * step_count * float(self._cfg.ctrl_dt) / cycle_seconds
+            obs_parts.append(np.stack([np.sin(phase), np.cos(phase)], axis=1).astype(dtype))
+        return np.concatenate(obs_parts, axis=1, dtype=dtype)
 
     def _compute_obs(
         self, info: dict[str, Any], dof_pos: np.ndarray, ball_pos: np.ndarray

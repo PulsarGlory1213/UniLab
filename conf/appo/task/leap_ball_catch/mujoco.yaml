@@ -11,6 +11,7 @@ training:
 reward:
   scales:
     rotate: 0.0
+    reverse_rotate: 0.0
     obj_linvel: 0.0
     intercept: 0.0
     finger_approach: 0.0
