@@ -1,0 +1,124 @@
+# @package _global_
+training:
+  task_name: LeapInhandRotationGrasp
+  sim_backend: mujoco
+  play_steps: 200
+  render_spacing: 0.5
+  cam_distance: 0.45
+  cam_lookat: [0.0, 0.0, 0.52]
+  cam_elevation: -25.0
+  cam_azimuth: 135.0
+  play_env_num: 1
+  render_width: 640
+  render_height: 352
+  render_num_processes: 1
+  replay_queue_size: 4
+  checkpoint_video:
+    enabled: true
+    play_steps: 200
+    play_env_num: 1
+    output_subdir: videos
+algo:
+  num_envs: 1024
+  steps_per_env: 8
+  max_iterations: 300
+  save_interval: 50
+  algorithm:
+    value_loss_coef: 4.0
+    entropy_coef: 0.005
+    learning_rate: 0.001
+    desired_kl: 0.02
+    adaptive_kl_factor: 2.0
+    adaptive_lr_factor: 1.5
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.998
+    lam: 0.98
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: adaptive
+  actor:
+    hidden_dims: [512, 256, 128]
+    activation: elu
+    obs_normalization: true
+    distribution_cfg:
+      class_name: rsl_rl.modules.distribution.GaussianDistribution
+      init_std: 1.0
+      std_type: scalar
+  critic:
+    hidden_dims: [512, 256, 128]
+    activation: elu
+    obs_normalization: true
+reward:
+  scales:
+    rotate: 5.0
+    reverse_rotate: -5.0
+    palm_contact: -0.25
+    obj_linvel: -0.3
+    pose_diff: -0.03
+    torque: -0.01
+    work: -0.001
+    drop: -5.0
+  angvel_clip_min: -0.5
+  angvel_clip_max: 0.5
+  reset_z_threshold: 0.54
+  rotation_warmup_seconds: 1.0
+env:
+  # 這是 grasp collector，不是 rotation task
+  gen_grasp: true
+
+  # 生成 cache 時不能又讀取舊 cache
+  use_grasp_cache: false
+
+  # 每個候選抓握要維持 2 秒才算成功
+  max_episode_seconds: 2.0
+
+  # Smoke test 先只收 128 組
+  grasp_cache_path: caches/leap_hand_grasp_smoke.npy
+  grasp_collection_target: 128
+
+  # 收滿自動存檔；中途正常關閉也會嘗試儲存
+  grasp_auto_save: true
+
+  # 開啟抓握品質檢查
+  grasp_quality_check: true
+
+  # 允許 2、3、4 指接觸
+  grasp_min_contacts: 2
+
+  # Smoke test 先不限制每種 contact mask 的數量
+  grasp_contact_mask_quota: 0
+
+  # 開始後先給 0.5 秒讓接觸穩定
+  grasp_warmup_seconds: 0.5
+
+  # 目前 grasp_gen.py 已有這些幾何參數；
+  # 第一階段先保留，之後才決定是否接進更嚴格 gate
+  grasp_pad_target_distances: [0.036, 0.039, 0.050, 0.042]
+  grasp_pad_surface_tolerance: 0.010
+  grasp_pad_alignment_minimums: [0.20, 0.20, 0.00, 0.20]
+  grasp_opposition_dot_max: 0.0
+
+  rotation_axis: [0.0, 0.0, 1.0]
+  rotation_cycle_seconds: 2.0
+  ctrl_dt: 0.02
+
+  control_config:
+    action_scale: 0.0416666667
+    target_mode: incremental
+    kp: 20.0
+    kd: 1.5
+
+  domain_rand:
+    randomize_base_mass: false
+    random_com: false
+    randomize_gravity: false
+    push_robots: false
+
+    # 從 scene.xml 的 home 附近產生不同候選姿勢
+    joint_noise: 0.02
+
+    # 收 cache 時先不要給球初速度
+    ball_vel_noise: 0.0
+    ball_z_offset: 0.0
