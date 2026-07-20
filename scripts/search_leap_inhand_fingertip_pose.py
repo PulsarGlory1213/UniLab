@@ -27,7 +27,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=200_000)
     parser.add_argument("--rounds", type=int, default=8)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--allegro-layout", action="store_true")
+    parser.add_argument(
+        "--four-side-layout",
+        "--allegro-layout",
+        dest="four_side_layout",
+        action="store_true",
+    )
     return parser.parse_args()
 
 
@@ -83,23 +88,45 @@ def main() -> int:
         dtype=np.float64,
     )
     rng = np.random.default_rng(args.seed)
-
-    if args.allegro_layout:
+    layout_directions: np.ndarray | None = None
+    if args.four_side_layout:
         # Allegro's authored home pose distributes the three main fingertips
         # across one side of the ball and opposes them with the thumb. Solve
         # LEAP's independent finger chains against the actual pad sites.
-        allegro_directions = np.array(
+        four_side_directions = np.array(
             [
-                [-0.6810, -0.3686, -0.6327],
-                [0.1441, -0.6999, -0.6995],
-                [0.7841, -0.2288, -0.5769],
-                [-0.1064, 0.7907, -0.6029],
+                # 食指：球的左前方
+                [-0.68, -0.39, -0.62],
+
+                # 中指：球的前下方
+                [0.00, -0.78, -0.62],
+
+                # 無名指：球的右前方
+                [0.68, -0.39, -0.62],
+
+                # 拇指：從另一個方向包住球
+                [0.00, 0.78, -0.62],
             ],
             dtype=np.float64,
         )
-        allegro_directions /= np.linalg.norm(allegro_directions, axis=1, keepdims=True)
-        pad_radii = np.array([0.039, 0.039, 0.039, 0.040], dtype=np.float64)
-        pad_targets = ball[None, :] + pad_radii[:, None] * allegro_directions
+
+        four_side_directions /= np.linalg.norm(
+            four_side_directions,
+            axis=1,
+            keepdims=True,
+        )
+
+        layout_directions = four_side_directions
+
+        pad_radii = np.array(
+            [0.039, 0.039, 0.039, 0.040],
+            dtype=np.float64,
+        )
+
+        pad_targets = (
+            ball[None, :]
+            + pad_radii[:, None] * four_side_directions
+        )
         solved = np.clip(center, lower, upper)
         finger_slices = (slice(0, 4), slice(4, 8), slice(8, 12), slice(12, 16))
         for finger_index, finger_slice in enumerate(finger_slices):
@@ -159,6 +186,29 @@ def main() -> int:
         distances = np.linalg.norm(to_ball, axis=1)
         directions = to_ball / np.maximum(distances[:, None], 1e-9)
         alignment = np.sum(normals * directions, axis=1)
+        layout_penalty = 0.0
+
+        if layout_directions is not None:
+            pad_directions = pads - ball[None, :]
+            pad_directions /= np.maximum(
+                np.linalg.norm(
+                    pad_directions,
+                    axis=1,
+                    keepdims=True,
+                ),
+                1e-9,
+            )
+        
+            layout_cosine = np.sum(
+                pad_directions * layout_directions,
+                axis=1,
+            )
+        
+            # 每根手指必須留在指定的球面區域，
+            # 避免最後又全部擠到同一側。
+            layout_penalty = np.square(
+                np.maximum(0.82 - layout_cosine, 0.0) / 0.18
+            ).sum()
         pad_targets = np.array([0.036, 0.039, 0.050, 0.040], dtype=np.float64)
         alignment_targets = np.array([0.20, 0.20, 0.00, 0.20], dtype=np.float64)
         surface = np.square((distances - pad_targets) / 0.010).sum()
@@ -172,8 +222,18 @@ def main() -> int:
                 for tip_id in tip_geom_ids
             ]
         )
+        positive_contact_gap = np.maximum(
+        tip_ball_distance - 0.0015,
+        0.0,
+        )
+
+        # 只要求距離球最近的兩根手指真正接觸。
+        # 另外兩根仍由 pad surface 與 layout penalty
+        # 約束在球的四周。
+        closest_two_gaps = np.sort(positive_contact_gap)[:2]
+
         contact_gap = np.square(
-            np.maximum(tip_ball_distance - 0.0015, 0.0) / 0.008
+            closest_two_gaps / 0.008
         ).sum()
         contact_penetration = np.square(
             np.maximum(-tip_ball_distance - 0.002, 0.0) / 0.003
@@ -183,11 +243,20 @@ def main() -> int:
         )
         palm_penalty = np.square(max(0.004 - palm_distance, 0.0) / 0.004)
         # Keep the three main fingertips fanned instead of stacked together.
+        # 四個 pad 都不能擠在一起。
         separation = 0.0
-        for first in range(3):
-            for second in range(first + 1, 3):
-                gap = np.linalg.norm(pads[first] - pads[second])
-                separation += float(np.square(max(0.035 - gap, 0.0) / 0.015))
+
+        for first in range(4):
+            for second in range(first + 1, 4):
+                gap = np.linalg.norm(
+                    pads[first] - pads[second]
+                )
+
+                separation += float(
+                    np.square(
+                        max(0.028 - gap, 0.0) / 0.012
+                    )
+                )
         # Avoid joint-limit tricks and sideways main-finger spread.
         normalized = (qpos - lower) / np.maximum(upper - lower, 1e-9)
         limit = np.square(np.maximum(np.abs(normalized - 0.5) - 0.46, 0.0) / 0.04).sum()
@@ -211,6 +280,7 @@ def main() -> int:
         score_value = (
             surface
             + 12.0 * facing
+            + 8.0 * layout_penalty
             + separation
             + limit
             + spread
@@ -264,8 +334,25 @@ def main() -> int:
         sensor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, name)
         address = int(model.sensor_adr[sensor_id])
         contact_values.append(float(data.sensordata[address]))
-    print("settled_ball:", np.round(data.qpos[16:19], 6).tolist())
-    print("settled_contacts [ff,mf,rf,th,palm]:", contact_values)
+    print(
+        "settled_pose:",
+        np.round(data.qpos[:16], 6).tolist(),
+    )
+    
+    print(
+        "settled_ball:",
+        np.round(data.qpos[16:19], 6).tolist(),
+    )
+    
+    print(
+        "settled_ball_quat:",
+        np.round(data.qpos[19:23], 6).tolist(),
+    )
+    
+    print(
+        "settled_contacts [ff,mf,rf,th,palm]:",
+        contact_values,
+    )
     return 0
 
 
