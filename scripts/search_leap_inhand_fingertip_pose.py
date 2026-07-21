@@ -1,417 +1,1005 @@
-"""Search a neutral LEAP in-hand pose with open fingers and natural contact geometry."""
+"""Retarget the Allegro in-hand home grasp to the LEAP Hand.
+
+The script reads the authored Allegro ``home`` keyframe and extracts its
+rotation-invariant grasp geometry:
+
+* fingertip directions around the ball;
+* pairwise fingertip spacing;
+* fingertip-to-ball surface gaps;
+* ball clearance from the palm.
+
+It then searches LEAP joint angles and a nearby ball position that reproduce
+that geometry. The contact surface is not prescribed: a finger may naturally
+support the ball with its pad, tip, or side.
+
+Finally, the best geometric candidates are simulated with MuJoCo. The output
+is the physically best settled pose, not merely the lowest kinematic score.
+The three main distal joints are also kept in a moderate Allegro-like range,
+so stability cannot be achieved by curling them to approximately 2 radians.
+"""
 
 from __future__ import annotations
 
 import argparse
+import heapq
+import re
+import shutil
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import mujoco
 import numpy as np
 
 from unilab.base.backend.mujoco.xml import materialize_scene_fragments
 
+
 ROOT = Path(__file__).resolve().parents[1]
-ASSET_DIR = ROOT / "src" / "unilab" / "assets" / "robots" / "leap_hand"
-TIP_GEOMS = (
+LEAP_DIR = ROOT / "src" / "unilab" / "assets" / "robots" / "leap_hand"
+ALLEGRO_DIR = ROOT / "src" / "unilab" / "assets" / "robots" / "allegro_hand"
+
+LEAP_TIP_GEOMS = (
     "fingertip_collision",
     "fingertip_2_collision",
     "fingertip_3_collision",
     "thumb_fingertip_collision",
 )
+ALLEGRO_TIP_GEOMS = (
+    "ff_tip_col",
+    "mf_tip_col",
+    "rf_tip_col",
+    "th_tip_col",
+)
+LEAP_CONTACT_SENSORS = (
+    "leap_ff_contact",
+    "leap_mf_contact",
+    "leap_rf_contact",
+    "leap_th_contact",
+    "leap_rotation_palm_contact",
+)
+
+# Semantic joint correspondence. LEAP qpos ordering is not simply 0,1,2,3:
+# the XML body traversal places joint "1" before joint "0".
+JOINT_MAP = (
+    (("ffj0", "ffj1", "ffj2", "ffj3"), ("0", "1", "2", "3")),
+    (("mfj0", "mfj1", "mfj2", "mfj3"), ("4", "5", "6", "7")),
+    (("rfj0", "rfj1", "rfj2", "rfj3"), ("8", "9", "10", "11")),
+    (("thj0", "thj1", "thj2", "thj3"), ("12", "13", "14", "15")),
+)
+
+
+@dataclass(frozen=True)
+class AllegroReference:
+    direction_gram: np.ndarray
+    pairwise_distance_by_radius: np.ndarray
+    sorted_surface_gaps_by_radius: np.ndarray
+    palm_gap_by_radius: float
+    palm_ball_ratio: float
+    normalized_joint_pose: dict[str, float]
+
+
+@dataclass
+class CandidateMetrics:
+    score: float
+    tip_gaps: np.ndarray
+    layout_rmse: float
+    pairwise_rmse: float
+    palm_gap: float
+    palm_ball_ratio: float
+
+
+@dataclass
+class SettledResult:
+    total_score: float
+    kinematic_score: float
+    qpos: np.ndarray
+    ball_pos: np.ndarray
+    ball_quat: np.ndarray
+    contacts: np.ndarray
+    tip_gaps: np.ndarray
+    palm_gap: float
+    ball_drop: float
+    recent_z_range: float
+    ball_speed: float
+    main_flex: np.ndarray
+    distal_flex: np.ndarray
+    passed: bool
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--samples", type=int, default=200_000)
+    parser = argparse.ArgumentParser(
+        description="Retarget Allegro's authored in-hand grasp to LEAP."
+    )
+    parser.add_argument("--samples", type=int, default=120_000)
     parser.add_argument("--rounds", type=int, default=8)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--physics-candidates", type=int, default=24)
+    parser.add_argument("--settle-steps", type=int, default=1500)
+    parser.add_argument(
+        "--ball-search-radius",
+        type=float,
+        default=0.020,
+        help="Maximum xyz change from LEAP's authored ball position, in metres.",
+    )
+    parser.add_argument(
+        "--distal-soft-limit",
+        type=float,
+        default=0.80,
+        help=(
+            "Soft limit in radians for the last joint of the three main "
+            "fingers. Curl above this value is strongly penalized."
+        ),
+    )
+    parser.add_argument(
+        "--distal-hard-limit",
+        type=float,
+        default=1.10,
+        help=(
+            "Hard search limit in radians for the last joint of the three "
+            "main fingers."
+        ),
+    )
+    parser.add_argument(
+        "--write-scene",
+        action="store_true",
+        help="Write a passing settled result into leap_hand/scene.xml.",
+    )
+    parser.add_argument(
+        "--force-write",
+        action="store_true",
+        help="Allow --write-scene even when the stability check fails.",
+    )
+
+    # Kept for compatibility with commands used earlier. The new implementation
+    # always uses the Allegro reference and does not hard-code four directions.
     parser.add_argument(
         "--four-side-layout",
         "--allegro-layout",
-        dest="four_side_layout",
         action="store_true",
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args()
 
 
-def main() -> int:
-    args = _parse_args()
+def _name_id(
+    model: mujoco.MjModel,
+    object_type: mujoco.mjtObj,
+    name: str,
+) -> int:
+    object_id = int(mujoco.mj_name2id(model, object_type, name))
+    if object_id < 0:
+        raise RuntimeError(f"MuJoCo object not found: {name}")
+    return object_id
+
+
+def _load_leap_model() -> mujoco.MjModel:
     materialized = Path(
         materialize_scene_fragments(
-            str(ASSET_DIR / "leap_hand.xml"),
-            fragment_files=[str(ASSET_DIR / "scene.xml")],
+            str(LEAP_DIR / "leap_hand.xml"),
+            fragment_files=[str(LEAP_DIR / "scene.xml")],
         )
     )
     try:
-        model = mujoco.MjModel.from_xml_path(str(materialized))
+        return mujoco.MjModel.from_xml_path(str(materialized))
     finally:
         materialized.unlink(missing_ok=True)
+
+
+def _load_home(
+    model: mujoco.MjModel,
+) -> mujoco.MjData:
     data = mujoco.MjData(model)
-    tip_geom_ids = np.array(
-        [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in TIP_GEOMS]
-    )
-    ball_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "ball")
-    palm_geom_id = mujoco.mj_name2id(
-        model, mujoco.mjtObj.mjOBJ_GEOM, "palm_lower_collision"
-    )
-    model_lower = model.jnt_range[:16, 0].copy()
-    model_upper = model.jnt_range[:16, 1].copy()
-    # Keep the three main fingers in a mostly straight family.
-    # In each 4-DoF main-finger slice, local indices 2 and 3 are the
-    # distal flexion joints. Their upper bounds are reduced so the
-    # optimizer cannot curl the fingertips deeply around the ball.
-    lower = np.array(
-        [0.35, -0.55, 0.00, -0.05] * 3 + [0.55, 0.05, 0.05, 0.05],
-        dtype=np.float64,
-    )
-    upper = np.array(
-        [1.80, 0.55, 1.00, 0.80] * 3 + [1.95, 1.55, 1.55, 1.55],
-        dtype=np.float64,
-    )
-    lower = np.maximum(lower, model_lower)
-    upper = np.minimum(upper, model_upper)
-    ball = np.array(
-        [-0.013583, -0.002142, 0.633196],
-        dtype=np.float64,
-    )
-    # Seed from a natural flexion pattern, not the former palm-catch cache.
-    center = np.array(
-        [
-            0.710557, 0.720452, 0.720249, -0.330859,
-            0.789181, 0.740685, 0.601233, 0.543166,
-            1.208433, -0.034896, 0.719992, 0.083205,
-            1.192924, 0.939653, 1.205634, 0.243515,
-        ],
-        dtype=np.float64,
-    )
-    rng = np.random.default_rng(args.seed)
-    if args.four_side_layout:
-        # Build a useful starting point one finger at a time.  This stage only
-        # asks each fingertip mesh to stay near the ball without prescribing
-        # which surface of the fingertip must touch or which exact direction
-        # around the ball the finger must occupy.  The full-hand objective below
-        # later spreads the four fingertips naturally.
-        solved = np.clip(center, lower, upper)
-        finger_slices = (
-            slice(0, 4),
-            slice(4, 8),
-            slice(8, 12),
-            slice(12, 16),
-        )
-
-        for finger_index, finger_slice in enumerate(finger_slices):
-            tip_geom_id = int(tip_geom_ids[finger_index])
-
-            def finger_score(finger_qpos: np.ndarray) -> float:
-                candidate = solved.copy()
-                candidate[finger_slice] = finger_qpos
-
-                data.qpos[:16] = candidate
-                data.qpos[16:19] = ball
-                data.qpos[19:23] = (1.0, 0.0, 0.0, 0.0)
-                mujoco.mj_forward(model, data)
-
-                # Use the real fingertip collision mesh.  A small positive gap
-                # is acceptable because only two fingers must actually contact
-                # the ball in the final pose.
-                tip_gap = mujoco.mj_geomDistance(
-                    model,
-                    data,
-                    tip_geom_id,
-                    int(ball_geom_id),
-                    0.2,
-                    None,
-                )
-                near_error = np.square(
-                    max(tip_gap - 0.008, 0.0) / 0.015
-                )
-                penetration_error = np.square(
-                    max(-tip_gap - 0.0015, 0.0) / 0.003
-                )
-
-                # Prefer a fairly open main-finger posture, but keep this soft so
-                # MuJoCo and the optimizer can choose fingertip, pad, or side
-                # contact naturally.
-                straight_error = 0.0
-                if finger_index < 3:
-                    distal = finger_qpos[2:4]
-                    straight_target = np.array(
-                        [0.20, 0.10],
-                        dtype=np.float64,
-                    )
-                    straight_scale = np.array(
-                        [0.45, 0.35],
-                        dtype=np.float64,
-                    )
-                    straight_error = np.square(
-                        (distal - straight_target) / straight_scale
-                    ).sum()
-
-                return float(
-                    8.0 * near_error
-                    + 2.0 * straight_error
-                    + 12.0 * penetration_error
-                )
-
-            finger_lower = lower[finger_slice]
-            finger_upper = upper[finger_slice]
-            finger_best = solved[finger_slice].copy()
-            finger_best_score = finger_score(finger_best)
-            finger_sigma = 0.35 * (finger_upper - finger_lower)
-            finger_rng = np.random.default_rng(args.seed + finger_index)
-
-            for ik_round in range(8):
-                if ik_round == 0:
-                    candidates = finger_rng.uniform(
-                        finger_lower,
-                        finger_upper,
-                        size=(8000, 4),
-                    )
-                else:
-                    candidates = (
-                        finger_best
-                        + finger_rng.normal(size=(8000, 4)) * finger_sigma
-                    )
-                    candidates = np.clip(
-                        candidates,
-                        finger_lower,
-                        finger_upper,
-                    )
-
-                for candidate in candidates:
-                    candidate_score = finger_score(candidate)
-                    if candidate_score < finger_best_score:
-                        finger_best_score = candidate_score
-                        finger_best = candidate.copy()
-
-                finger_sigma *= 0.48
-
-            solved[finger_slice] = finger_best
-            print(
-                f"finger={finger_index} ik_score={finger_best_score:.6f} "
-                f"qpos={np.round(finger_best, 6).tolist()}"
-            )
-
-        center = solved
-
-    def score(qpos: np.ndarray) -> tuple[float, np.ndarray]:
-        data.qpos[:16] = qpos
-        data.qpos[16:19] = ball
-        data.qpos[19:23] = (1.0, 0.0, 0.0, 0.0)
-        mujoco.mj_forward(model, data)
-
-        tips = data.geom_xpos[tip_geom_ids].copy()
-
-        # Real ball-to-fingertip-mesh distance:
-        # positive = separated, zero = touching, negative = penetrating.
-        tip_ball_distance = np.array(
-            [
-                mujoco.mj_geomDistance(
-                    model,
-                    data,
-                    int(tip_id),
-                    int(ball_geom_id),
-                    0.2,
-                    None,
-                )
-                for tip_id in tip_geom_ids
-            ],
-            dtype=np.float64,
-        )
-
-        # Keep all four fingertips available near the ball.  Contact orientation
-        # is deliberately unconstrained: pad, tip, and side contact are all valid.
-        all_four_near = np.square(
-            np.maximum(tip_ball_distance - 0.012, 0.0) / 0.015
-        ).sum()
-
-        # Require whichever two fingertips happen to be closest to reach contact.
-        # No specific finger pair is selected.
-        positive_contact_gap = np.maximum(
-            tip_ball_distance - 0.0015,
-            0.0,
-        )
-        closest_two_gaps = np.sort(positive_contact_gap)[:2]
-        contact_gap = np.square(closest_two_gaps / 0.008).sum()
-
-        contact_penetration = np.square(
-            np.maximum(-tip_ball_distance - 0.0015, 0.0) / 0.003
-        ).sum()
-
-        palm_distance = mujoco.mj_geomDistance(
-            model,
-            data,
-            int(palm_geom_id),
-            int(ball_geom_id),
-            0.2,
-            None,
-        )
-        palm_penalty = np.square(
-            max(0.004 - palm_distance, 0.0) / 0.004
-        )
-
-        # Spread the four fingertip bodies without assigning any finger to a
-        # fixed compass direction around the ball.
-        separation = 0.0
-        for first in range(4):
-            for second in range(first + 1, 4):
-                gap = np.linalg.norm(tips[first] - tips[second])
-                separation += float(
-                    np.square(max(0.028 - gap, 0.0) / 0.012)
-                )
-
-        # Soft preference for the visually open, nearly straight main fingers
-        # from the reference pose.  It is not a hard contact prescription.
-        main_distal_indices = np.array(
-            [2, 3, 6, 7, 10, 11],
-            dtype=np.int32,
-        )
-        straight_target = np.array(
-            [0.20, 0.10, 0.20, 0.10, 0.20, 0.10],
-            dtype=np.float64,
-        )
-        straight_scale = np.array(
-            [0.45, 0.35, 0.45, 0.35, 0.45, 0.35],
-            dtype=np.float64,
-        )
-        straight_penalty = np.square(
-            (qpos[main_distal_indices] - straight_target) / straight_scale
-        ).sum()
-
-        normalized = (qpos - lower) / np.maximum(upper - lower, 1e-9)
-        limit = np.square(
-            np.maximum(np.abs(normalized - 0.5) - 0.46, 0.0) / 0.04
-        ).sum()
-        spread = 0.15 * np.square(qpos[[1, 5, 9]] / 0.65).sum()
-
-        # A mild thumb-opposition prior keeps the hand useful for in-hand
-        # manipulation while still allowing any finger pair and contact surface.
-        main_side = np.mean(tips[:3] - ball, axis=0)
-        thumb_side = tips[3] - ball
-        main_side /= max(np.linalg.norm(main_side), 1e-9)
-        thumb_side /= max(np.linalg.norm(thumb_side), 1e-9)
-        opposition = np.square(
-            max(np.dot(main_side, thumb_side) + 0.25, 0.0) / 0.25
-        )
-
-        # Reject solutions that push any hand link deeply through the ball.
-        penetration = 0.0
-        for contact_index in range(data.ncon):
-            contact = data.contact[contact_index]
-            geom_names = {
-                mujoco.mj_id2name(
-                    model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom1
-                ),
-                mujoco.mj_id2name(
-                    model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom2
-                ),
-            }
-            if "ball" in geom_names and contact.dist < -0.002:
-                penetration += float(
-                    np.square((-contact.dist - 0.002) / 0.003)
-                )
-
-        score_value = (
-            4.0 * all_four_near
-            + separation
-            + limit
-            + spread
-            + 2.0 * straight_penalty
-            + 2.0 * opposition
-            + 10.0 * contact_gap
-            + 10.0 * contact_penetration
-            + 12.0 * palm_penalty
-            + 8.0 * penetration
-        )
-
-        return float(score_value), tip_ball_distance
-
-    best_score, best_tip_gap = score(center)
-    best = center.copy()
-    sigma = np.array([0.55, 0.50, 0.65, 0.55] * 3 + [0.55, 0.65, 0.65, 0.65])
-    per_round = max(1, args.samples // max(args.rounds, 1))
-    for round_index in range(args.rounds):
-        if round_index == 0:
-            candidates = rng.uniform(lower, upper, size=(per_round, 16))
-        else:
-            candidates = best + rng.normal(size=(per_round, 16)) * sigma
-            candidates = np.clip(candidates, lower, upper)
-        for candidate in candidates:
-            candidate_score, tip_gap = score(candidate)
-            if candidate_score < best_score:
-                best_score = candidate_score
-                best = candidate.copy()
-                best_tip_gap = tip_gap
-        sigma *= 0.58
-        print(
-            f"round={round_index + 1} score={best_score:.6f} "
-            f"tip_gap={np.round(best_tip_gap, 5).tolist()}"
-        )
-    print("pose:", np.round(best, 6).tolist())
-    data.qpos[:16] = best
-    data.qpos[16:19] = ball
-    data.qpos[19:23] = (1.0, 0.0, 0.0, 0.0)
-    data.ctrl[:] = best
-    data.qvel[:] = 0.0
+    key_id = _name_id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    mujoco.mj_resetDataKeyframe(model, data, key_id)
     mujoco.mj_forward(model, data)
-    for _ in range(750):
-        mujoco.mj_step(model, data)
-    contact_values = []
-    for name in (
-        "leap_ff_contact",
-        "leap_mf_contact",
-        "leap_rf_contact",
-        "leap_th_contact",
-        "leap_rotation_palm_contact",
-    ):
-        sensor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, name)
-        address = int(model.sensor_adr[sensor_id])
-        contact_values.append(float(data.sensordata[address]))
-    print(
-        "settled_pose:",
-        np.round(data.qpos[:16], 6).tolist(),
+    return data
+
+
+def _geom_ids(model: mujoco.MjModel, names: Iterable[str]) -> np.ndarray:
+    return np.asarray(
+        [
+            _name_id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+            for name in names
+        ],
+        dtype=np.int32,
     )
 
-    print(
-        "settled_ball:",
-        np.round(data.qpos[16:19], 6).tolist(),
-    )
 
-    print(
-        "settled_ball_quat:",
-        np.round(data.qpos[19:23], 6).tolist(),
-    )
-
-    print(
-        "settled_contacts [ff,mf,rf,th,palm]:",
-        contact_values,
-    )
-
-    settled_tip_gap = np.array(
+def _surface_gaps(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    first_geom_ids: np.ndarray,
+    second_geom_id: int,
+) -> np.ndarray:
+    return np.asarray(
         [
             mujoco.mj_geomDistance(
                 model,
                 data,
-                int(tip_id),
-                int(ball_geom_id),
-                0.2,
+                int(first_id),
+                int(second_geom_id),
+                0.25,
                 None,
             )
-            for tip_id in tip_geom_ids
+            for first_id in first_geom_ids
         ],
         dtype=np.float64,
     )
-    print(
-        "settled_tip_gap:",
-        np.round(settled_tip_gap, 6).tolist(),
+
+
+def _pairwise_values(points: np.ndarray) -> np.ndarray:
+    values: list[float] = []
+    for first in range(len(points)):
+        for second in range(first + 1, len(points)):
+            values.append(float(np.linalg.norm(points[first] - points[second])))
+    return np.asarray(values, dtype=np.float64)
+
+
+def _direction_gram(tips: np.ndarray, ball: np.ndarray) -> np.ndarray:
+    directions = tips - ball[None, :]
+    directions /= np.maximum(
+        np.linalg.norm(directions, axis=1, keepdims=True),
+        1e-9,
     )
+    return directions @ directions.T
+
+
+def _collision_geom_for_body(
+    model: mujoco.MjModel,
+    body_name: str,
+) -> int:
+    body_id = _name_id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    candidates = [
+        geom_id
+        for geom_id in range(model.ngeom)
+        if int(model.geom_bodyid[geom_id]) == body_id
+        and int(model.geom_contype[geom_id]) != 0
+    ]
+    if not candidates:
+        raise RuntimeError(
+            f"No collision geom was found on body {body_name!r}."
+        )
+    return int(candidates[0])
+
+
+def _joint_value(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    joint_name: str,
+) -> float:
+    joint_id = _name_id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+    qpos_address = int(model.jnt_qposadr[joint_id])
+    return float(data.qpos[qpos_address])
+
+
+def _joint_normalized_value(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    joint_name: str,
+) -> float:
+    joint_id = _name_id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+    lower, upper = model.jnt_range[joint_id]
+    value = _joint_value(model, data, joint_name)
+    return float((value - lower) / max(float(upper - lower), 1e-9))
+
+
+def _extract_allegro_reference() -> AllegroReference:
+    model = mujoco.MjModel.from_xml_path(str(ALLEGRO_DIR / "scene.xml"))
+    data = _load_home(model)
+
+    tip_ids = _geom_ids(model, ALLEGRO_TIP_GEOMS)
+    ball_id = _name_id(model, mujoco.mjtObj.mjOBJ_GEOM, "ball")
+    palm_id = _collision_geom_for_body(model, "palm")
+    palm_body_id = _name_id(model, mujoco.mjtObj.mjOBJ_BODY, "palm")
+
+    tips = data.geom_xpos[tip_ids].copy()
+    ball = data.geom_xpos[ball_id].copy()
+    palm = data.xpos[palm_body_id].copy()
+    ball_radius = float(model.geom_size[ball_id, 0])
+
+    gaps = _surface_gaps(model, data, tip_ids, ball_id)
+    palm_gap = float(
+        mujoco.mj_geomDistance(
+            model,
+            data,
+            palm_id,
+            ball_id,
+            0.25,
+            None,
+        )
+    )
+
+    mean_tip_reach = float(
+        np.mean(np.linalg.norm(tips - palm[None, :], axis=1))
+    )
+    palm_ball_ratio = float(
+        np.linalg.norm(ball - palm) / max(mean_tip_reach, 1e-9)
+    )
+
+    normalized_joint_pose: dict[str, float] = {}
+    for allegro_names, _ in JOINT_MAP:
+        for name in allegro_names:
+            normalized_joint_pose[name] = _joint_normalized_value(
+                model,
+                data,
+                name,
+            )
+
+    return AllegroReference(
+        direction_gram=_direction_gram(tips, ball),
+        pairwise_distance_by_radius=_pairwise_values(tips) / ball_radius,
+        sorted_surface_gaps_by_radius=np.sort(gaps) / ball_radius,
+        palm_gap_by_radius=palm_gap / ball_radius,
+        palm_ball_ratio=palm_ball_ratio,
+        normalized_joint_pose=normalized_joint_pose,
+    )
+
+
+def _leap_joint_bounds(
+    model: mujoco.MjModel,
+) -> tuple[np.ndarray, np.ndarray]:
+    lower = np.full(16, -np.inf, dtype=np.float64)
+    upper = np.full(16, np.inf, dtype=np.float64)
+
+    for joint_id in range(model.njnt):
+        qpos_address = int(model.jnt_qposadr[joint_id])
+        if qpos_address >= 16:
+            continue
+        lower[qpos_address], upper[qpos_address] = model.jnt_range[joint_id]
+
+    if not np.all(np.isfinite(lower)) or not np.all(np.isfinite(upper)):
+        raise RuntimeError("Could not resolve all 16 LEAP joint limits.")
+    return lower, upper
+
+
+def _allegro_mapped_seed(
+    leap_model: mujoco.MjModel,
+    current_hand_qpos: np.ndarray,
+    reference: AllegroReference,
+) -> np.ndarray:
+    seed = current_hand_qpos.copy()
+
+    for allegro_names, leap_names in JOINT_MAP:
+        for allegro_name, leap_name in zip(
+            allegro_names,
+            leap_names,
+            strict=True,
+        ):
+            leap_joint_id = _name_id(
+                leap_model,
+                mujoco.mjtObj.mjOBJ_JOINT,
+                leap_name,
+            )
+            qpos_address = int(leap_model.jnt_qposadr[leap_joint_id])
+            lower, upper = leap_model.jnt_range[leap_joint_id]
+            normalized = reference.normalized_joint_pose[allegro_name]
+            seed[qpos_address] = lower + normalized * (upper - lower)
+
+    return seed
+
+
+def _contact_values(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+) -> np.ndarray:
+    values = []
+    for name in LEAP_CONTACT_SENSORS:
+        sensor_id = _name_id(model, mujoco.mjtObj.mjOBJ_SENSOR, name)
+        address = int(model.sensor_adr[sensor_id])
+        values.append(float(data.sensordata[address]))
+    return np.asarray(values, dtype=np.float64)
+
+
+def _write_home_keyframe(
+    hand_qpos: np.ndarray,
+    ball_pos: np.ndarray,
+    ball_quat: np.ndarray,
+) -> None:
+    scene_path = LEAP_DIR / "scene.xml"
+    backup_path = scene_path.with_suffix(".xml.bak")
+    shutil.copy2(scene_path, backup_path)
+
+    qpos_values = np.concatenate((hand_qpos, ball_pos, ball_quat))
+    qpos_text = " ".join(f"{value:.9g}" for value in qpos_values)
+    ctrl_text = " ".join(f"{value:.9g}" for value in hand_qpos)
+
+    original = scene_path.read_text(encoding="utf-8")
+    pattern = re.compile(
+        r'(<key\s+name="home"\s+qpos=")[^"]*("\s+ctrl=")[^"]*("\s*/>)',
+        flags=re.DOTALL,
+    )
+    replacement = rf'\g<1>{qpos_text}\g<2>{ctrl_text}\g<3>'
+    updated, count = pattern.subn(replacement, original, count=1)
+    if count != 1:
+        raise RuntimeError(
+            "Could not uniquely locate <key name=\"home\"> in scene.xml."
+        )
+
+    scene_path.write_text(updated, encoding="utf-8")
+    print(f"Updated: {scene_path}")
+    print(f"Backup:  {backup_path}")
+
+
+def main() -> int:
+    args = _parse_args()
+    if args.samples < args.rounds:
+        raise ValueError("--samples must be at least --rounds.")
+    if args.physics_candidates < 1:
+        raise ValueError("--physics-candidates must be positive.")
+
+    reference = _extract_allegro_reference()
+    model = _load_leap_model()
+    data = _load_home(model)
+
+    tip_ids = _geom_ids(model, LEAP_TIP_GEOMS)
+    ball_geom_id = _name_id(model, mujoco.mjtObj.mjOBJ_GEOM, "ball")
+    palm_geom_id = _name_id(
+        model,
+        mujoco.mjtObj.mjOBJ_GEOM,
+        "palm_lower_collision",
+    )
+    palm_body_id = _name_id(
+        model,
+        mujoco.mjtObj.mjOBJ_BODY,
+        "palm_lower",
+    )
+    home_key_id = _name_id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    ball_radius = float(model.geom_size[ball_geom_id, 0])
+
+    current_hand = data.qpos[:16].copy()
+    current_ball = data.qpos[16:19].copy()
+    mapped_hand = _allegro_mapped_seed(model, current_hand, reference)
+
+    lower_hand, upper_hand = _leap_joint_bounds(model)
+
+    # For the three non-thumb fingers:
+    # qpos[2, 6, 10] are the middle flexion joints;
+    # qpos[3, 7, 11] are the final/distal flexion joints.
+    main_flex_indices = np.asarray([2, 6, 10], dtype=np.int32)
+    distal_flex_indices = np.asarray([3, 7, 11], dtype=np.int32)
+
+    if args.distal_soft_limit <= 0.0:
+        raise ValueError("--distal-soft-limit must be positive.")
+    if args.distal_hard_limit <= args.distal_soft_limit:
+        raise ValueError(
+            "--distal-hard-limit must be greater than --distal-soft-limit."
+        )
+
+    # Do not allow the optimizer to solve the grasp by curling the fingertip
+    # joints to roughly 1.8-2.0 rad, which was the main visual mismatch with
+    # Allegro.
+    upper_hand[distal_flex_indices] = np.minimum(
+        upper_hand[distal_flex_indices],
+        float(args.distal_hard_limit),
+    )
+
+    ball_delta = float(args.ball_search_radius)
+    lower = np.concatenate(
+        (
+            lower_hand,
+            current_ball - ball_delta,
+        )
+    )
+    upper = np.concatenate(
+        (
+            upper_hand,
+            current_ball + ball_delta,
+        )
+    )
+
+    # Prevent the search from moving the ball so far down that the palm/floor
+    # becomes an accidental support.
+    lower[18] = max(lower[18], current_ball[2] - 0.010)
+    upper[18] = current_ball[2] + ball_delta
+
+    mapped_seed = np.concatenate((mapped_hand, current_ball))
+    current_seed = np.concatenate((current_hand, current_ball))
+    center = 0.80 * mapped_seed + 0.20 * current_seed
+    center = np.clip(center, lower, upper)
+
+    range_width = upper - lower
+    sigma = 0.28 * range_width
+    sigma[16:19] = min(0.012, ball_delta)
+
+    min_sigma = 0.012 * range_width
+    min_sigma[16:19] = 0.0015
+
+    seed_normalized = (mapped_hand - lower_hand) / np.maximum(
+        upper_hand - lower_hand,
+        1e-9,
+    )
+
+    target_gram = reference.direction_gram
+    target_pairs = reference.pairwise_distance_by_radius
+    target_sorted_gaps = reference.sorted_surface_gaps_by_radius
+
+    def score(vector: np.ndarray) -> CandidateMetrics:
+        hand_qpos = vector[:16]
+        ball_pos = vector[16:19]
+
+        data.qpos[:16] = hand_qpos
+        data.qpos[16:19] = ball_pos
+        data.qpos[19:23] = (1.0, 0.0, 0.0, 0.0)
+        data.qvel[:] = 0.0
+        mujoco.mj_forward(model, data)
+
+        tips = data.geom_xpos[tip_ids].copy()
+        ball = data.geom_xpos[ball_geom_id].copy()
+        palm = data.xpos[palm_body_id].copy()
+
+        tip_gaps = _surface_gaps(
+            model,
+            data,
+            tip_ids,
+            ball_geom_id,
+        )
+        palm_gap = float(
+            mujoco.mj_geomDistance(
+                model,
+                data,
+                palm_geom_id,
+                ball_geom_id,
+                0.25,
+                None,
+            )
+        )
+
+        gram = _direction_gram(tips, ball)
+        triangle = np.triu_indices(4, k=1)
+        gram_error = gram[triangle] - target_gram[triangle]
+        layout_rmse = float(np.sqrt(np.mean(np.square(gram_error))))
+        layout_penalty = np.square(gram_error / 0.22).sum()
+
+        pairwise = _pairwise_values(tips) / ball_radius
+        pairwise_error = pairwise - target_pairs
+        pairwise_rmse = float(np.sqrt(np.mean(np.square(pairwise_error))))
+        pairwise_penalty = np.square(pairwise_error / 0.35).sum()
+
+        sorted_gaps = np.sort(tip_gaps) / ball_radius
+        gap_error = sorted_gaps - target_sorted_gaps
+        gap_match = np.square(gap_error / 0.16).sum()
+
+        # All four fingertips stay in the manipulation region. At least two
+        # should be almost touching, and a third should be close enough to
+        # take over during rotation.
+        positive_gap = np.maximum(tip_gaps, 0.0)
+        all_near = np.square(
+            np.maximum(positive_gap - 0.012, 0.0) / 0.010
+        ).sum()
+        closest = np.sort(positive_gap)
+        two_support = np.square(
+            np.maximum(closest[:2] - 0.002, 0.0) / 0.004
+        ).sum()
+        third_ready = float(
+            np.square(max(closest[2] - 0.007, 0.0) / 0.007)
+        )
+
+        penetration = np.square(
+            np.maximum(-tip_gaps - 0.0015, 0.0) / 0.0025
+        ).sum()
+
+        # Match Allegro's palm clearance, while strongly rejecting a ball
+        # that is resting on the LEAP palm.
+        target_palm_gap = reference.palm_gap_by_radius * ball_radius
+        palm_match = float(
+            np.square((palm_gap - target_palm_gap) / 0.008)
+        )
+        palm_too_close = float(
+            np.square(max(0.007 - palm_gap, 0.0) / 0.004)
+        )
+
+        mean_tip_reach = float(
+            np.mean(np.linalg.norm(tips - palm[None, :], axis=1))
+        )
+        palm_ball_ratio = float(
+            np.linalg.norm(ball - palm) / max(mean_tip_reach, 1e-9)
+        )
+        palm_ball_error = float(
+            np.square(
+                (palm_ball_ratio - reference.palm_ball_ratio) / 0.12
+            )
+        )
+
+        normalized = (hand_qpos - lower_hand) / np.maximum(
+            upper_hand - lower_hand,
+            1e-9,
+        )
+        limit_penalty = np.square(
+            np.maximum(np.abs(normalized - 0.5) - 0.47, 0.0) / 0.03
+        ).sum()
+
+        # Keep the overall pose somewhat Allegro-like, but do not prescribe
+        # whether contact uses the pad, tip, or side.
+        pose_prior = 0.60 * np.square(
+            (normalized - seed_normalized) / 0.40
+        ).sum()
+
+        main_flex = hand_qpos[main_flex_indices]
+        distal_flex = hand_qpos[distal_flex_indices]
+
+        # The middle flexion joints may bend naturally. Only very straight or
+        # excessively curled values are discouraged.
+        main_flex_penalty = (
+            np.square(
+                np.maximum(0.15 - main_flex, 0.0) / 0.25
+            ).sum()
+            + np.square(
+                np.maximum(main_flex - 1.25, 0.0) / 0.30
+            ).sum()
+        )
+
+        # Allegro's authored grasp uses modest distal flexion. This is only a
+        # weak shape preference around 0.30 rad.
+        distal_shape_penalty = np.square(
+            (distal_flex - 0.30) / 0.45
+        ).sum()
+
+        # Strongly reject the previous failure mode where qpos[3], qpos[7],
+        # and qpos[11] curled toward 1.8-2.0 rad.
+        distal_curl_penalty = np.square(
+            np.maximum(
+                distal_flex - float(args.distal_soft_limit),
+                0.0,
+            )
+            / 0.18
+        ).sum()
+
+        non_tip_ball_penetration = 0.0
+        self_penetration = 0.0
+        tip_id_set = {int(value) for value in tip_ids}
+        for contact_index in range(data.ncon):
+            contact = data.contact[contact_index]
+            first = int(contact.geom1)
+            second = int(contact.geom2)
+            distance = float(contact.dist)
+
+            if distance >= -0.001:
+                continue
+
+            pair = {first, second}
+            if ball_geom_id in pair:
+                other = second if first == ball_geom_id else first
+                if other not in tip_id_set:
+                    non_tip_ball_penetration += float(
+                        np.square((-distance - 0.001) / 0.0025)
+                    )
+            elif first != 0 and second != 0:
+                self_penetration += float(
+                    np.square((-distance - 0.001) / 0.0025)
+                )
+
+        score_value = (
+            8.0 * layout_penalty
+            + 2.5 * pairwise_penalty
+            + 1.5 * gap_match
+            + 6.0 * all_near
+            + 14.0 * two_support
+            + 5.0 * third_ready
+            + 14.0 * penetration
+            + 1.5 * palm_match
+            + 24.0 * palm_too_close
+            + 1.0 * palm_ball_error
+            + limit_penalty
+            + pose_prior
+            + 2.0 * main_flex_penalty
+            + 0.75 * distal_shape_penalty
+            + 12.0 * distal_curl_penalty
+            + 18.0 * non_tip_ball_penetration
+            + 5.0 * self_penetration
+        )
+
+        return CandidateMetrics(
+            score=float(score_value),
+            tip_gaps=tip_gaps,
+            layout_rmse=layout_rmse,
+            pairwise_rmse=pairwise_rmse,
+            palm_gap=palm_gap,
+            palm_ball_ratio=palm_ball_ratio,
+        )
+
+    rng = np.random.default_rng(args.seed)
+    per_round = max(1, args.samples // args.rounds)
+    elite_count = min(64, max(8, per_round // 250))
+    top_heap: list[tuple[float, int, np.ndarray]] = []
+    heap_counter = 0
+
+    best_vector = center.copy()
+    best_metrics = score(best_vector)
+
+    print("Allegro reference loaded automatically.")
     print(
-        "settled_main_distal:",
+        "target pairwise cosines:",
         np.round(
-            data.qpos[[2, 3, 6, 7, 10, 11]],
-            6,
+            reference.direction_gram[np.triu_indices(4, k=1)],
+            4,
         ).tolist(),
     )
+    print(
+        "target sorted tip gaps / radius:",
+        np.round(reference.sorted_surface_gaps_by_radius, 4).tolist(),
+    )
+    print()
+
+    for round_index in range(args.rounds):
+        candidates = center + rng.normal(
+            size=(per_round, len(center))
+        ) * sigma
+
+        if round_index == 0:
+            uniform_count = max(1, per_round // 5)
+            candidates[:uniform_count, :16] = rng.uniform(
+                lower_hand,
+                upper_hand,
+                size=(uniform_count, 16),
+            )
+            candidates[:uniform_count, 16:19] = rng.uniform(
+                lower[16:19],
+                upper[16:19],
+                size=(uniform_count, 3),
+            )
+
+        candidates = np.clip(candidates, lower, upper)
+        candidates[0] = best_vector
+        scores = np.empty(per_round, dtype=np.float64)
+
+        for candidate_index, candidate in enumerate(candidates):
+            metrics = score(candidate)
+            scores[candidate_index] = metrics.score
+
+            if metrics.score < best_metrics.score:
+                best_metrics = metrics
+                best_vector = candidate.copy()
+
+            entry = (-metrics.score, heap_counter, candidate.copy())
+            heap_counter += 1
+            if len(top_heap) < args.physics_candidates:
+                heapq.heappush(top_heap, entry)
+            elif metrics.score < -top_heap[0][0]:
+                heapq.heapreplace(top_heap, entry)
+
+        elite_indices = np.argpartition(
+            scores,
+            elite_count - 1,
+        )[:elite_count]
+        elites = candidates[elite_indices]
+        elite_mean = np.mean(elites, axis=0)
+        elite_std = np.std(elites, axis=0)
+
+        center = 0.25 * center + 0.75 * elite_mean
+        sigma = np.maximum(
+            0.45 * sigma + 0.55 * elite_std,
+            min_sigma,
+        )
+
+        print(
+            f"round={round_index + 1} "
+            f"score={best_metrics.score:.6f} "
+            f"tip_gap={np.round(best_metrics.tip_gaps, 5).tolist()} "
+            f"layout_rmse={best_metrics.layout_rmse:.4f} "
+            f"pair_rmse={best_metrics.pairwise_rmse:.4f} "
+            f"palm_gap={best_metrics.palm_gap:.5f} "
+            f"ball={np.round(best_vector[16:19], 6).tolist()}"
+        )
+
+    top_candidates = [
+        entry[2]
+        for entry in sorted(
+            top_heap,
+            key=lambda item: -item[0],
+        )
+    ]
+
+    def settle_candidate(vector: np.ndarray) -> SettledResult:
+        metrics = score(vector)
+        hand_qpos = vector[:16]
+        ball_pos = vector[16:19]
+
+        mujoco.mj_resetDataKeyframe(model, data, home_key_id)
+        data.qpos[:16] = hand_qpos
+        data.qpos[16:19] = ball_pos
+        data.qpos[19:23] = (1.0, 0.0, 0.0, 0.0)
+        data.qvel[:] = 0.0
+        data.ctrl[:16] = hand_qpos
+        mujoco.mj_forward(model, data)
+
+        initial_z = float(data.qpos[18])
+        recent_z: list[float] = []
+
+        for step_index in range(args.settle_steps):
+            mujoco.mj_step(model, data)
+            if step_index >= max(0, args.settle_steps - 250):
+                recent_z.append(float(data.qpos[18]))
+
+        contacts = _contact_values(model, data)
+        settled_gaps = _surface_gaps(
+            model,
+            data,
+            tip_ids,
+            ball_geom_id,
+        )
+        settled_palm_gap = float(
+            mujoco.mj_geomDistance(
+                model,
+                data,
+                palm_geom_id,
+                ball_geom_id,
+                0.25,
+                None,
+            )
+        )
+
+        final_z = float(data.qpos[18])
+        ball_drop = initial_z - final_z
+        recent_z_range = (
+            float(np.ptp(np.asarray(recent_z)))
+            if recent_z
+            else 0.0
+        )
+        ball_speed = float(np.linalg.norm(data.qvel[16:19]))
+        finger_contact_count = int(
+            np.count_nonzero(contacts[:4] > 0.5)
+        )
+        palm_contact = bool(contacts[4] > 0.5)
+        settled_main_flex = data.qpos[main_flex_indices].copy()
+        settled_distal_flex = data.qpos[distal_flex_indices].copy()
+
+        settled_distal_excess = np.maximum(
+            settled_distal_flex - float(args.distal_soft_limit),
+            0.0,
+        )
+        settled_distal_penalty = np.square(
+            settled_distal_excess / 0.18
+        ).sum()
+        distal_shape_ok = bool(
+            np.max(settled_distal_flex)
+            <= float(args.distal_hard_limit) + 0.05
+        )
+
+        passed = (
+            finger_contact_count >= 2
+            and not palm_contact
+            and ball_drop <= 0.010
+            and recent_z_range <= 0.003
+            and ball_speed <= 0.040
+            and float(np.max(settled_gaps)) <= 0.018
+            and distal_shape_ok
+        )
+
+        physics_penalty = (
+            250.0 * np.square(max(ball_drop - 0.003, 0.0) / 0.010)
+            + 35.0 * max(2 - finger_contact_count, 0)
+            + 45.0 * float(palm_contact)
+            + 20.0 * np.square(ball_speed / 0.040)
+            + 15.0 * np.square(recent_z_range / 0.003)
+            + 20.0
+            * np.square(
+                max(float(np.max(settled_gaps)) - 0.015, 0.0)
+                / 0.010
+            )
+            + 18.0 * settled_distal_penalty
+        )
+
+        return SettledResult(
+            total_score=float(metrics.score + physics_penalty),
+            kinematic_score=metrics.score,
+            qpos=data.qpos[:16].copy(),
+            ball_pos=data.qpos[16:19].copy(),
+            ball_quat=data.qpos[19:23].copy(),
+            contacts=contacts,
+            tip_gaps=settled_gaps,
+            palm_gap=settled_palm_gap,
+            ball_drop=ball_drop,
+            recent_z_range=recent_z_range,
+            ball_speed=ball_speed,
+            main_flex=settled_main_flex,
+            distal_flex=settled_distal_flex,
+            passed=passed,
+        )
+
+    print()
+    print(
+        f"Running MuJoCo settling for {len(top_candidates)} candidates..."
+    )
+
+    settled_results: list[SettledResult] = []
+    for candidate_index, candidate in enumerate(top_candidates):
+        result = settle_candidate(candidate)
+        settled_results.append(result)
+        print(
+            f"candidate={candidate_index + 1:02d} "
+            f"total={result.total_score:.4f} "
+            f"contacts={np.round(result.contacts, 2).tolist()} "
+            f"drop_mm={result.ball_drop * 1000:.2f} "
+            f"speed={result.ball_speed:.4f} "
+            f"max_distal={np.max(result.distal_flex):.3f} "
+            f"palm_gap={result.palm_gap:.5f} "
+            f"pass={result.passed}"
+        )
+
+    passing = [result for result in settled_results if result.passed]
+    if passing:
+        best_result = min(passing, key=lambda result: result.total_score)
+    else:
+        best_result = min(
+            settled_results,
+            key=lambda result: result.total_score,
+        )
+
+    print()
+    print("===== BEST SETTLED RESULT =====")
+    print("status:", "PASS" if best_result.passed else "FAIL")
+    print(
+        "settled_pose:",
+        np.round(best_result.qpos, 6).tolist(),
+    )
+    print(
+        "settled_ball:",
+        np.round(best_result.ball_pos, 6).tolist(),
+    )
+    print(
+        "settled_ball_quat:",
+        np.round(best_result.ball_quat, 6).tolist(),
+    )
+    print(
+        "settled_contacts [ff,mf,rf,th,palm]:",
+        np.round(best_result.contacts, 3).tolist(),
+    )
+    print(
+        "settled_tip_gap:",
+        np.round(best_result.tip_gaps, 6).tolist(),
+    )
+    print(
+        "settled_main_flex [q2,q6,q10]:",
+        np.round(best_result.main_flex, 6).tolist(),
+    )
+    print(
+        "settled_distal_flex [q3,q7,q11]:",
+        np.round(best_result.distal_flex, 6).tolist(),
+    )
+    print(f"settled_palm_gap: {best_result.palm_gap:.6f}")
+    print(f"ball_drop_mm: {best_result.ball_drop * 1000:.3f}")
+    print(
+        f"last_window_z_range_mm: "
+        f"{best_result.recent_z_range * 1000:.3f}"
+    )
+    print(f"ball_speed: {best_result.ball_speed:.6f}")
+
+    print()
+    print("Copy-paste keyframe values:")
+    print(
+        "qpos=\""
+        + " ".join(
+            f"{value:.9g}"
+            for value in np.concatenate(
+                (
+                    best_result.qpos,
+                    best_result.ball_pos,
+                    best_result.ball_quat,
+                )
+            )
+        )
+        + "\""
+    )
+    print(
+        "ctrl=\""
+        + " ".join(f"{value:.9g}" for value in best_result.qpos)
+        + "\""
+    )
+
+    if args.write_scene:
+        if best_result.passed or args.force_write:
+            _write_home_keyframe(
+                best_result.qpos,
+                best_result.ball_pos,
+                best_result.ball_quat,
+            )
+        else:
+            print()
+            print(
+                "scene.xml was not changed because the best result failed "
+                "the stability check. Use --force-write only for debugging."
+            )
+
     return 0
 
 
