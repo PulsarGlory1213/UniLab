@@ -109,6 +109,7 @@ class SettledResult:
     distal_flex: np.ndarray
     thumb_pose: np.ndarray
     support_fraction: float
+    finger_contact_fractions: np.ndarray
     palm_contact_fraction: float
     validation_z_drop: float
     horizontal_drift: float
@@ -157,6 +158,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--real-contact-gap",
+        type=float,
+        default=0.00035,
+        help=(
+            "Maximum actual geom surface gap for a finger to count "
+            "as a real contact, in metres."
+        ),
+    )
+    parser.add_argument(
         "--ball-search-radius",
         type=float,
         default=0.020,
@@ -179,6 +189,117 @@ def _parse_args() -> argparse.Namespace:
             "Hard search limit in radians for the last joint of the three "
             "main fingers."
         ),
+    )
+    parser.add_argument(
+        "--num-output-seeds",
+        type=int,
+        default=8,
+        help="Number of diverse, stable seed poses to save.",
+    )
+    parser.add_argument(
+        "--seed-bank-path",
+        type=str,
+        default="caches/leap_hand_seed_bank.npy",
+        help=(
+            "Output path for the seed bank. Relative paths are resolved "
+            "under src/unilab/assets."
+        ),
+    )
+    parser.add_argument(
+        "--save-seed-bank",
+        action="store_true",
+        help="Save diverse passing poses as a (K, 23) NumPy seed bank.",
+    )
+    parser.add_argument(
+        "--min-seed-rms-distance",
+        type=float,
+        default=0.06,
+        help="Minimum RMS hand-joint distance between saved seeds, in radians.",
+    )
+    parser.add_argument(
+        "--max-seed-joint-delta",
+        type=float,
+        default=0.45,
+        help=(
+            "Maximum absolute joint difference from seed 0. This keeps seed "
+            "transitions small enough for in-hand rotation."
+        ),
+    )
+    parser.add_argument(
+        "--contact-fraction-threshold",
+        type=float,
+        default=0.70,
+        help=(
+            "A finger is classified as a sustained contact only when it is "
+            "in contact for at least this fraction of the final validation "
+            "window."
+        ),
+    )
+    parser.add_argument(
+        "--min-unique-contact-masks",
+        type=int,
+        default=3,
+        help=(
+            "Minimum number of sustained contact masks required before a "
+            "seed bank is considered complete."
+        ),
+    )
+    parser.add_argument(
+        "--targeted-physics-candidates",
+        type=int,
+        default=8,
+        help=(
+            "Extra candidates retained for middle-finger bridge and takeover "
+            "states, in addition to the generic physics candidates."
+        ),
+    )
+    parser.add_argument(
+        "--allow-incomplete-seed-bank",
+        action="store_true",
+        help=(
+            "Save a seed bank even when strict handoff coverage is missing. "
+            "This is intended only for debugging."
+        ),
+    )
+    parser.add_argument(
+        "--index-main-soft-limit",
+        type=float,
+        default=0.90,
+        help="Soft upper limit for the index middle-flex joint q2.",
+    )
+    parser.add_argument(
+        "--index-distal-soft-limit",
+        type=float,
+        default=0.60,
+        help="Soft upper limit for the index distal joint q3.",
+    )
+    parser.add_argument(
+        "--index-min-height-offset",
+        type=float,
+        default=-0.004,
+        help=(
+            "Lowest allowed index-tip height relative to ball center, in metres."
+        ),
+    )
+    parser.add_argument(
+        "--index-max-height-offset",
+        type=float,
+        default=0.014,
+        help=(
+            "Highest preferred index-tip height relative to ball center, in metres."
+        ),
+    )
+    parser.add_argument(
+        "--index-gap-target",
+        type=float,
+        default=0.004,
+        help="Preferred maximum index fingertip-to-ball surface gap.",
+    )
+    parser.add_argument(
+        "--middle-gap-target",
+        type=float,
+        default=0.005,
+        help="Preferred maximum middle fingertip-to-ball surface gap.",
     )
     parser.add_argument(
         "--write-scene",
@@ -461,6 +582,335 @@ def _write_home_keyframe(
     print(f"Backup:  {backup_path}")
 
 
+def _resolve_seed_bank_path(seed_bank_path: str) -> Path:
+    path = Path(seed_bank_path)
+    if path.is_absolute():
+        return path
+    return ROOT / "src" / "unilab" / "assets" / path
+
+
+def _contact_mask(contacts: np.ndarray) -> int:
+    """Return a 4-bit mask in [ff, mf, rf, th] bit order."""
+    finger_contacts = np.asarray(contacts[:4] > 0.5, dtype=np.int32)
+    return int(
+        np.sum(
+            finger_contacts
+            * (1 << np.arange(4, dtype=np.int32))
+        )
+    )
+
+
+def _sustained_contact_mask(
+    result: SettledResult,
+    threshold: float,
+) -> int:
+    """Classify contacts using the whole final validation window."""
+    active = np.asarray(
+        result.finger_contact_fractions >= threshold,
+        dtype=np.int32,
+    )
+    return int(
+        np.sum(active * (1 << np.arange(4, dtype=np.int32)))
+    )
+
+
+def _mask_text(mask: int) -> str:
+    """Human-readable mask using ff/mf/rf/th names."""
+    names = ("ff", "mf", "rf", "th")
+    active = [
+        name
+        for index, name in enumerate(names)
+        if mask & (1 << index)
+    ]
+    return "+".join(active) if active else "none"
+
+
+def _joint_rms(first: SettledResult, second: SettledResult) -> float:
+    return float(
+        np.sqrt(np.mean(np.square(first.qpos - second.qpos)))
+    )
+
+
+def _compatible_with_seed0(
+    candidate: SettledResult,
+    seed0: SettledResult,
+    max_joint_delta: float,
+) -> bool:
+    return bool(
+        np.max(np.abs(candidate.qpos - seed0.qpos))
+        <= max_joint_delta
+    )
+
+
+def _select_diverse_seeds(
+    passing: list[SettledResult],
+    num_output_seeds: int,
+    min_rms_distance: float,
+    max_joint_delta: float,
+    contact_fraction_threshold: float,
+    min_unique_contact_masks: int,
+) -> tuple[list[SettledResult], list[str]]:
+    """Select a local seed sequence with strict finger-handoff coverage.
+
+    A complete seed bank must include all of the following:
+
+    1. At least one seed with sustained middle-finger contact.
+    2. At least one middle-takeover seed where the middle finger sustains
+       contact while the index finger is released.
+    3. At least ``min_unique_contact_masks`` sustained contact masks.
+
+    The function never fills missing stages with another copy of the default
+    ff+rf+th support pattern. If the requirements cannot be met, it returns a
+    partial bank together with explicit missing requirements.
+    """
+    if not passing:
+        return [], ["no stable passing candidates"]
+
+    ordered = sorted(passing, key=lambda result: result.total_score)
+    seed0 = ordered[0]
+    selected: list[SettledResult] = [seed0]
+
+    def is_selected(candidate: SettledResult) -> bool:
+        return any(candidate is chosen for chosen in selected)
+
+    def is_locally_compatible(candidate: SettledResult) -> bool:
+        if not _compatible_with_seed0(
+            candidate,
+            seed0,
+            max_joint_delta,
+        ):
+            return False
+        if is_selected(candidate):
+            return False
+        return True
+
+    def sustained_active(candidate: SettledResult) -> np.ndarray:
+        return (
+            candidate.finger_contact_fractions
+            >= contact_fraction_threshold
+        )
+
+    def choose_required(
+        predicate,
+        *,
+        prefer_new_mask: bool = True,
+    ) -> SettledResult | None:
+        used_masks = {
+            _sustained_contact_mask(
+                chosen,
+                contact_fraction_threshold,
+            )
+            for chosen in selected
+        }
+        eligible: list[SettledResult] = []
+
+        for candidate in ordered:
+            if not is_locally_compatible(candidate):
+                continue
+            if not predicate(candidate):
+                continue
+
+            # Required stages may be close to seed 0 because a small transition
+            # is desirable. They only need to differ measurably.
+            if _joint_rms(candidate, seed0) < min(
+                min_rms_distance,
+                0.025,
+            ):
+                continue
+            eligible.append(candidate)
+
+        if not eligible:
+            return None
+
+        def rank(candidate: SettledResult) -> tuple[float, float, float]:
+            mask = _sustained_contact_mask(
+                candidate,
+                contact_fraction_threshold,
+            )
+            new_mask = 1.0 if mask not in used_masks else 0.0
+            distance = min(
+                _joint_rms(candidate, chosen)
+                for chosen in selected
+            )
+            return (
+                new_mask if prefer_new_mask else 0.0,
+                distance,
+                -candidate.total_score,
+            )
+
+        return max(eligible, key=rank)
+
+    # Stage A: the middle finger must actually participate for most of the
+    # validation window.
+    middle_seed = choose_required(
+        lambda candidate: bool(
+            sustained_active(candidate)[1]
+            and np.count_nonzero(sustained_active(candidate)) >= 2
+        )
+    )
+    if middle_seed is not None:
+        selected.append(middle_seed)
+
+    # Stage B: explicit handoff coverage. The middle finger supports the ball
+    # while the index finger is released. At least one additional finger must
+    # remain active so this is still a stable grasp.
+    middle_takeover_seed = choose_required(
+        lambda candidate: bool(
+            sustained_active(candidate)[1]
+            and not sustained_active(candidate)[0]
+            and np.count_nonzero(sustained_active(candidate)) >= 2
+        )
+    )
+    if (
+        middle_takeover_seed is not None
+        and not is_selected(middle_takeover_seed)
+    ):
+        selected.append(middle_takeover_seed)
+
+    # Stage C: fill missing unique masks before filling with generic diversity.
+    while len(selected) < num_output_seeds:
+        used_masks = {
+            _sustained_contact_mask(
+                chosen,
+                contact_fraction_threshold,
+            )
+            for chosen in selected
+        }
+        if len(used_masks) >= min_unique_contact_masks:
+            break
+
+        candidates: list[SettledResult] = []
+        for candidate in ordered:
+            if not is_locally_compatible(candidate):
+                continue
+            mask = _sustained_contact_mask(
+                candidate,
+                contact_fraction_threshold,
+            )
+            if mask in used_masks:
+                continue
+            distances = [
+                _joint_rms(candidate, chosen)
+                for chosen in selected
+            ]
+            if min(distances) < min_rms_distance:
+                continue
+            candidates.append(candidate)
+
+        if not candidates:
+            break
+
+        selected.append(
+            max(
+                candidates,
+                key=lambda candidate: (
+                    min(
+                        _joint_rms(candidate, chosen)
+                        for chosen in selected
+                    ),
+                    -candidate.total_score,
+                ),
+            )
+        )
+
+    # Fill remaining slots, still preferring unseen masks and local diversity.
+    while len(selected) < num_output_seeds:
+        used_masks = {
+            _sustained_contact_mask(
+                chosen,
+                contact_fraction_threshold,
+            )
+            for chosen in selected
+        }
+        best_candidate: SettledResult | None = None
+        best_priority: tuple[float, float, float] | None = None
+
+        for candidate in ordered:
+            if not is_locally_compatible(candidate):
+                continue
+
+            distances = [
+                _joint_rms(candidate, chosen)
+                for chosen in selected
+            ]
+            min_distance = min(distances)
+            if min_distance < min_rms_distance:
+                continue
+
+            mask = _sustained_contact_mask(
+                candidate,
+                contact_fraction_threshold,
+            )
+            priority = (
+                1.0 if mask not in used_masks else 0.0,
+                min_distance,
+                -candidate.total_score,
+            )
+            if best_priority is None or priority > best_priority:
+                best_priority = priority
+                best_candidate = candidate
+
+        if best_candidate is None:
+            break
+
+        selected.append(best_candidate)
+
+    masks = [
+        _sustained_contact_mask(
+            result,
+            contact_fraction_threshold,
+        )
+        for result in selected
+    ]
+    active_arrays = [
+        result.finger_contact_fractions
+        >= contact_fraction_threshold
+        for result in selected
+    ]
+
+    missing: list[str] = []
+    if not any(active[1] for active in active_arrays):
+        missing.append(
+            "no seed has sustained middle-finger contact"
+        )
+    if not any(
+        active[1]
+        and not active[0]
+        and np.count_nonzero(active) >= 2
+        for active in active_arrays
+    ):
+        missing.append(
+            "no middle-takeover seed has mf contact with ff released"
+        )
+    unique_masks = len(set(masks))
+    if unique_masks < min_unique_contact_masks:
+        missing.append(
+            f"only {unique_masks} unique sustained contact masks "
+            f"(need {min_unique_contact_masks})"
+        )
+
+    return selected, missing
+
+
+def _save_seed_bank(
+    seed_bank_path: str,
+    seeds: list[SettledResult],
+) -> Path:
+    output_path = _resolve_seed_bank_path(seed_bank_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    states = np.stack(
+        [
+            np.concatenate(
+                (seed.qpos, seed.ball_pos, seed.ball_quat)
+            )
+            for seed in seeds
+        ],
+        axis=0,
+    ).astype(np.float32)
+    np.save(output_path, states)
+    return output_path
+
+
 def main() -> int:
     args = _parse_args()
     if args.samples < args.rounds:
@@ -476,6 +926,29 @@ def main() -> int:
         )
     if not 0.0 <= args.min_support_fraction <= 1.0:
         raise ValueError("--min-support-fraction must be in [0, 1].")
+    if args.num_output_seeds < 1:
+        raise ValueError("--num-output-seeds must be positive.")
+    if args.min_seed_rms_distance < 0.0:
+        raise ValueError("--min-seed-rms-distance must be non-negative.")
+    if args.max_seed_joint_delta <= 0.0:
+        raise ValueError("--max-seed-joint-delta must be positive.")
+    if not 0.0 < args.contact_fraction_threshold <= 1.0:
+        raise ValueError(
+            "--contact-fraction-threshold must be in (0, 1]."
+        )
+    if args.min_unique_contact_masks < 2:
+        raise ValueError(
+            "--min-unique-contact-masks must be at least 2."
+        )
+    if args.targeted_physics_candidates < 1:
+        raise ValueError(
+            "--targeted-physics-candidates must be positive."
+        )
+    if args.index_min_height_offset >= args.index_max_height_offset:
+        raise ValueError(
+            "--index-min-height-offset must be smaller than "
+            "--index-max-height-offset."
+        )
 
     reference = _extract_allegro_reference()
     model = _load_leap_model()
@@ -659,10 +1132,17 @@ def main() -> int:
         ).sum()
         closest = np.sort(positive_gap)
         two_support = np.square(
-            np.maximum(closest[:2] - 0.002, 0.0) / 0.004
+            np.maximum(
+                closest[:2] - float(args.real_contact_gap),
+                0.0,
+            )
+            / 0.0015
         ).sum()
         third_ready = float(
-            np.square(max(closest[2] - 0.007, 0.0) / 0.007)
+            np.square(
+                max(closest[2] - 0.004, 0.0)
+                / 0.004
+            )
         )
 
         penetration = np.square(
@@ -749,6 +1229,55 @@ def main() -> int:
             + np.square(max(-0.08 - thumb_pose[3], 0.0) / 0.14)
         )
 
+        # Transition-ready neutral pose:
+        # - keep the index straighter than the previous default pose;
+        # - place the index near the side of the ball rather than underneath it;
+        # - keep the middle finger close enough to take over with a small motion.
+        index_main = float(hand_qpos[2])
+        index_distal = float(hand_qpos[3])
+        index_shape_penalty = (
+            np.square(
+                max(index_main - float(args.index_main_soft_limit), 0.0)
+                / 0.20
+            )
+            + np.square(
+                max(index_distal - float(args.index_distal_soft_limit), 0.0)
+                / 0.16
+            )
+        )
+
+        index_height_offset = float(tips[0, 2] - ball[2])
+        index_side_height_penalty = (
+            np.square(
+                max(
+                    float(args.index_min_height_offset) - index_height_offset,
+                    0.0,
+                )
+                / 0.006
+            )
+            + np.square(
+                max(
+                    index_height_offset - float(args.index_max_height_offset),
+                    0.0,
+                )
+                / 0.008
+            )
+        )
+        index_gap_penalty = np.square(
+            max(
+                float(tip_gaps[0]) - float(args.index_gap_target),
+                0.0,
+            )
+            / 0.004
+        )
+        middle_gap_penalty = np.square(
+            max(
+                float(tip_gaps[1]) - float(args.middle_gap_target),
+                0.0,
+            )
+            / 0.004
+        )
+
         non_tip_ball_penetration = 0.0
         self_penetration = 0.0
         tip_id_set = {int(value) for value in tip_ids}
@@ -791,6 +1320,10 @@ def main() -> int:
             + 12.0 * distal_curl_penalty
             + 3.0 * thumb_pose_penalty
             + 10.0 * thumb_twist_penalty
+            + 8.0 * index_shape_penalty
+            + 8.0 * index_side_height_penalty
+            + 10.0 * index_gap_penalty
+            + 8.0 * middle_gap_penalty
             + 18.0 * non_tip_ball_penetration
             + 5.0 * self_penetration
         )
@@ -808,7 +1341,27 @@ def main() -> int:
     per_round = max(1, args.samples // args.rounds)
     elite_count = min(64, max(8, per_round // 250))
     top_heap: list[tuple[float, int, np.ndarray]] = []
+    middle_bridge_heap: list[tuple[float, int, np.ndarray]] = []
+    middle_takeover_heap: list[tuple[float, int, np.ndarray]] = []
     heap_counter = 0
+
+    def push_candidate(
+        heap: list[tuple[float, int, np.ndarray]],
+        candidate_score: float,
+        candidate: np.ndarray,
+        capacity: int,
+    ) -> None:
+        nonlocal heap_counter
+        entry = (
+            -float(candidate_score),
+            heap_counter,
+            candidate.copy(),
+        )
+        heap_counter += 1
+        if len(heap) < capacity:
+            heapq.heappush(heap, entry)
+        elif candidate_score < -heap[0][0]:
+            heapq.heapreplace(heap, entry)
 
     best_vector = center.copy()
     best_metrics = score(best_vector)
@@ -857,12 +1410,87 @@ def main() -> int:
                 best_metrics = metrics
                 best_vector = candidate.copy()
 
-            entry = (-metrics.score, heap_counter, candidate.copy())
-            heap_counter += 1
-            if len(top_heap) < args.physics_candidates:
-                heapq.heappush(top_heap, entry)
-            elif metrics.score < -top_heap[0][0]:
-                heapq.heapreplace(top_heap, entry)
+            push_candidate(
+                top_heap,
+                metrics.score,
+                candidate,
+                int(args.physics_candidates),
+            )
+
+            # Targeted pool 1: middle finger nearly contacts while index and
+            # thumb remain close enough to form a bridge state.
+            positive_gaps = np.maximum(metrics.tip_gaps, 0.0)
+            bridge_score = (
+                metrics.score
+                + 18.0
+                * np.square(
+                    max(
+                        float(positive_gaps[1])
+                        - float(args.real_contact_gap),
+                        0.0,
+                    )
+                    / 0.004
+                )
+                + 5.0
+                * np.square(
+                    max(float(positive_gaps[0]) - 0.008, 0.0)
+                    / 0.006
+                )
+                + 5.0
+                * np.square(
+                    max(float(positive_gaps[3]) - 0.006, 0.0)
+                    / 0.006
+                )
+            )
+            push_candidate(
+                middle_bridge_heap,
+                bridge_score,
+                candidate,
+                int(args.targeted_physics_candidates),
+            )
+
+            # Targeted pool 2: middle finger is at contact distance while the
+            # index is intentionally 4-10 mm away. This creates candidates
+            # where the ball can be supported after the index releases.
+            target_index_gap = 0.007
+            takeover_score = (
+                metrics.score
+                + 22.0
+                * np.square(
+                    max(
+                        float(positive_gaps[1])
+                        - float(args.real_contact_gap),
+                        0.0,
+                    )
+                    / 0.0035
+                )
+                + 8.0
+                * np.square(
+                    (
+                        float(positive_gaps[0])
+                        - target_index_gap
+                    )
+                    / 0.004
+                )
+                + 5.0
+                * np.square(
+                    max(
+                        min(
+                            float(positive_gaps[2]),
+                            float(positive_gaps[3]),
+                        )
+                        - 0.006,
+                        0.0,
+                    )
+                    / 0.006
+                )
+            )
+            push_candidate(
+                middle_takeover_heap,
+                takeover_score,
+                candidate,
+                int(args.targeted_physics_candidates),
+            )
 
         elite_indices = np.argpartition(
             scores,
@@ -888,13 +1516,30 @@ def main() -> int:
             f"ball={np.round(best_vector[16:19], 6).tolist()}"
         )
 
-    top_candidates = [
-        entry[2]
-        for entry in sorted(
-            top_heap,
-            key=lambda item: -item[0],
-        )
-    ]
+    candidate_entries = (
+        sorted(top_heap, key=lambda item: -item[0])
+        + sorted(middle_bridge_heap, key=lambda item: -item[0])
+        + sorted(middle_takeover_heap, key=lambda item: -item[0])
+    )
+
+    # A candidate may appear in multiple pools. Deduplicate exact numerical
+    # states before the expensive long-duration MuJoCo validation.
+    top_candidates: list[np.ndarray] = []
+    seen_candidates: set[bytes] = set()
+    for _, _, candidate in candidate_entries:
+        key = np.round(candidate, decimals=9).tobytes()
+        if key in seen_candidates:
+            continue
+        seen_candidates.add(key)
+        top_candidates.append(candidate)
+
+    print(
+        "Candidate pools: "
+        f"generic={len(top_heap)}, "
+        f"middle_bridge={len(middle_bridge_heap)}, "
+        f"middle_takeover={len(middle_takeover_heap)}, "
+        f"unique_total={len(top_candidates)}"
+    )
 
     def settle_candidate(vector: np.ndarray) -> SettledResult:
         metrics = score(vector)
@@ -928,23 +1573,61 @@ def main() -> int:
         recent_z: list[float] = []
         recent_xy: list[np.ndarray] = []
         recent_contact_counts: list[int] = []
+        recent_finger_contacts: list[np.ndarray] = []
         recent_palm_contacts: list[bool] = []
 
         for step_index in range(total_steps):
             mujoco.mj_step(model, data)
 
             if step_index >= window_start:
-                step_contacts = _contact_values(model, data)
-                recent_z.append(float(data.qpos[18]))
-                recent_xy.append(data.qpos[16:18].copy())
-                recent_contact_counts.append(
-                    int(np.count_nonzero(step_contacts[:4] > 0.5))
-                )
-                recent_palm_contacts.append(
-                    bool(step_contacts[4] > 0.5)
+                step_sensor_contacts = _contact_values(model, data)
+
+                step_tip_gaps = _surface_gaps(
+                    model,
+                    data,
+                    tip_ids,
+                    ball_geom_id,
                 )
 
-        contacts = _contact_values(model, data)
+                step_palm_gap = float(
+                    mujoco.mj_geomDistance(
+                        model,
+                        data,
+                        palm_geom_id,
+                        ball_geom_id,
+                        0.25,
+                        None,
+                    )
+                )
+
+                recent_z.append(float(data.qpos[18]))
+                recent_xy.append(data.qpos[16:18].copy())
+
+                # Sensor contact is not enough because MuJoCo margin may create
+                # a contact while the visual surfaces are still separated.
+                step_finger_contacts = (
+                    (step_sensor_contacts[:4] > 0.5)
+                    & (
+                        step_tip_gaps
+                        <= float(args.real_contact_gap)
+                    )
+                )
+
+                step_palm_contact = bool(
+                    step_sensor_contacts[4] > 0.5
+                    and step_palm_gap
+                    <= float(args.real_contact_gap)
+                )
+
+                recent_contact_counts.append(
+                    int(np.count_nonzero(step_finger_contacts))
+                )
+                recent_finger_contacts.append(
+                    step_finger_contacts.copy()
+                )
+                recent_palm_contacts.append(step_palm_contact)
+
+        raw_contacts = _contact_values(model, data)
         settled_gaps = _surface_gaps(
             model,
             data,
@@ -959,6 +1642,31 @@ def main() -> int:
                 ball_geom_id,
                 0.25,
                 None,
+            )
+        )
+
+        settled_finger_contacts = (
+            (raw_contacts[:4] > 0.5)
+            & (
+                settled_gaps
+                <= float(args.real_contact_gap)
+            )
+        )
+
+        settled_palm_contact = bool(
+            raw_contacts[4] > 0.5
+            and settled_palm_gap
+            <= float(args.real_contact_gap)
+        )
+
+        # Store honest contact results instead of raw margin contacts.
+        contacts = np.concatenate(
+            (
+                settled_finger_contacts.astype(np.float64),
+                np.asarray(
+                    [float(settled_palm_contact)],
+                    dtype=np.float64,
+                ),
             )
         )
 
@@ -994,6 +1702,17 @@ def main() -> int:
             )
             if recent_contact_counts
             else 0.0
+        )
+        finger_contact_fractions = (
+            np.mean(
+                np.asarray(
+                    recent_finger_contacts,
+                    dtype=np.float64,
+                ),
+                axis=0,
+            )
+            if recent_finger_contacts
+            else np.zeros(4, dtype=np.float64)
         )
         palm_contact_fraction = (
             float(np.mean(recent_palm_contacts))
@@ -1047,6 +1766,11 @@ def main() -> int:
 
         passed = (
             finger_contact_count >= 2
+            and bool(contacts[3] > 0.5)
+            and (
+                finger_contact_fractions[3]
+                >= float(args.contact_fraction_threshold)
+            )
             and not palm_contact
             and support_fraction >= float(args.min_support_fraction)
             and palm_contact_fraction <= 0.02
@@ -1056,6 +1780,8 @@ def main() -> int:
             and horizontal_drift <= 0.003
             and ball_speed <= 0.020
             and float(np.max(settled_gaps)) <= 0.018
+            and float(settled_gaps[0]) <= 0.007
+            and float(settled_gaps[1]) <= 0.010
             and distal_shape_ok
             and thumb_shape_ok
         )
@@ -1103,6 +1829,10 @@ def main() -> int:
             distal_flex=settled_distal_flex,
             thumb_pose=settled_thumb_pose,
             support_fraction=support_fraction,
+            finger_contact_fractions=np.asarray(
+                finger_contact_fractions,
+                dtype=np.float64,
+            ),
             palm_contact_fraction=palm_contact_fraction,
             validation_z_drop=validation_z_drop,
             horizontal_drift=horizontal_drift,
@@ -1135,8 +1865,24 @@ def main() -> int:
 
     passing = [result for result in settled_results if result.passed]
     if passing:
-        best_result = min(passing, key=lambda result: result.total_score)
+        selected_seeds, missing_seed_requirements = _select_diverse_seeds(
+            passing,
+            num_output_seeds=int(args.num_output_seeds),
+            min_rms_distance=float(args.min_seed_rms_distance),
+            max_joint_delta=float(args.max_seed_joint_delta),
+            contact_fraction_threshold=float(
+                args.contact_fraction_threshold
+            ),
+            min_unique_contact_masks=int(
+                args.min_unique_contact_masks
+            ),
+        )
+        best_result = selected_seeds[0]
     else:
+        selected_seeds = []
+        missing_seed_requirements = [
+            "no stable passing candidates"
+        ]
         best_result = min(
             settled_results,
             key=lambda result: result.total_score,
@@ -1220,6 +1966,90 @@ def main() -> int:
         + " ".join(f"{value:.9g}" for value in best_result.qpos)
         + "\""
     )
+
+    print()
+    print("===== DIVERSE SEED BANK =====")
+    if selected_seeds:
+        for seed_index, seed_result in enumerate(selected_seeds):
+            rms_from_seed0 = float(
+                np.sqrt(
+                    np.mean(
+                        np.square(
+                            seed_result.qpos - selected_seeds[0].qpos
+                        )
+                    )
+                )
+            )
+            max_delta_from_seed0 = float(
+                np.max(
+                    np.abs(
+                        seed_result.qpos - selected_seeds[0].qpos
+                    )
+                )
+            )
+            sustained_mask = _sustained_contact_mask(
+                seed_result,
+                float(args.contact_fraction_threshold),
+            )
+            print(
+                f"seed={seed_index:02d} "
+                f"mask={sustained_mask:04b} "
+                f"support={_mask_text(sustained_mask):<11} "
+                f"fractions="
+                f"{np.round(seed_result.finger_contact_fractions, 2).tolist()} "
+                f"score={seed_result.total_score:.4f} "
+                f"rms_from_seed0={rms_from_seed0:.4f} "
+                f"max_delta_from_seed0={max_delta_from_seed0:.4f} "
+                f"gaps={np.round(seed_result.tip_gaps, 5).tolist()}"
+            )
+    else:
+        print("No passing seeds were found.")
+
+    print()
+    if missing_seed_requirements:
+        print("STRICT SEED COVERAGE: FAIL")
+        for requirement in missing_seed_requirements:
+            print(f"  - {requirement}")
+    else:
+        print("STRICT SEED COVERAGE: PASS")
+        print(
+            "  - middle finger has a sustained-contact seed"
+        )
+        print(
+            "  - a middle-takeover seed exists with index released"
+        )
+        print(
+            f"  - at least {args.min_unique_contact_masks} "
+            "unique sustained contact masks exist"
+        )
+
+    if args.save_seed_bank:
+        can_save_complete_bank = (
+            bool(selected_seeds)
+            and (
+                not missing_seed_requirements
+                or bool(args.allow_incomplete_seed_bank)
+            )
+        )
+        if not can_save_complete_bank:
+            print(
+                "Seed bank was not saved because strict handoff coverage "
+                "is incomplete."
+            )
+            print(
+                "Increase --physics-candidates, "
+                "--targeted-physics-candidates, or --samples. "
+                "Use --allow-incomplete-seed-bank only for debugging."
+            )
+        else:
+            output_path = _save_seed_bank(
+                str(args.seed_bank_path),
+                selected_seeds,
+            )
+            print(
+                f"Saved seed bank: {output_path}, "
+                f"shape=({len(selected_seeds)}, 23)"
+            )
 
     if args.write_scene:
         if best_result.passed or args.force_write:
