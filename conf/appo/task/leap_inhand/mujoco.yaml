@@ -113,7 +113,7 @@ reward:
   # 允許拇指 + 任一手指的兩指支撐階段
   stable_rotation_min_contacts: 2
   contact_rotation_min_contacts: 2
-
+#++
   # 稍微放寬球心與線速度，讓球能在指間滾動
   stable_center_radius: 0.025
   stable_ball_linvel_max: 0.08
