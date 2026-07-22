@@ -24,11 +24,12 @@ class NoiseConfig:
 
 @dataclass
 class ControlConfig:
-    action_scale: float = 1.0 / 24.0
+    # Scalar keeps the old behavior; a 16-value list allows joint-specific control.
+    action_scale: float | list[float] = 1.0 / 24.0
     kp: float = 1.0
     kd: float = 0.1
     target_mode: str = "incremental"
-    target_offset_limit: float = 0.35
+    target_offset_limit: float | list[float] = 0.35
 
 
 @dataclass
@@ -65,6 +66,15 @@ class LeapHandBaseEnv(NpEnv):
         if self._num_action != self._NUM_HAND_DOF:
             raise ValueError(f"Expected {self._NUM_HAND_DOF} actuators, got {self._num_action}")
 
+        self._action_scale = self._resolve_control_vector(
+            self._cfg.control_config.action_scale,
+            "control_config.action_scale",
+        )
+        self._target_offset_limit = self._resolve_control_vector(
+            self._cfg.control_config.target_offset_limit,
+            "control_config.target_offset_limit",
+        )
+
         self._init_buffers()
         self.nq = int(self._init_qpos.shape[0])
         self.nv = int(self._init_qvel.shape[0])
@@ -83,6 +93,24 @@ class LeapHandBaseEnv(NpEnv):
     @property
     def action_space(self) -> gym.spaces.Box:
         return self._action_space  # type: ignore[no-any-return]
+
+    def _resolve_control_vector(
+        self, value: float | list[float], name: str
+    ) -> np.ndarray:
+        """Resolve a scalar or a 16-value Hydra list into one value per actuator."""
+        resolved = np.asarray(value, dtype=self._np_dtype)
+        if resolved.ndim == 0:
+            resolved = np.full(
+                (self._num_action,), float(resolved), dtype=self._np_dtype
+            )
+        if resolved.shape != (self._num_action,):
+            raise ValueError(
+                f"{name} must be a scalar or {self._num_action} values, "
+                f"got shape {resolved.shape}"
+            )
+        if not np.all(np.isfinite(resolved)) or np.any(resolved <= 0.0):
+            raise ValueError(f"{name} values must all be finite and positive")
+        return resolved
 
     def _init_buffers(self) -> None:
         self.default_angles = np.zeros((self._num_action,), dtype=self._np_dtype)
@@ -130,11 +158,9 @@ class LeapHandBaseEnv(NpEnv):
                 f"or 'default_offset', got {target_mode!r}"
             )
 
-        new_ctrl = reference + self._cfg.control_config.action_scale * clipped_actions
+        new_ctrl = reference + self._action_scale * clipped_actions
         if target_mode == "bounded_incremental":
-            offset_limit = float(self._cfg.control_config.target_offset_limit)
-            if offset_limit <= 0.0:
-                raise ValueError("control_config.target_offset_limit must be positive")
+            offset_limit = self._target_offset_limit
             center = state.info.get(
                 "init_pose",
                 np.broadcast_to(

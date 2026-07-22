@@ -116,6 +116,22 @@ class RewardConfigPPO:
     rotation_streak_target_seconds: float = 2.0
     stall_grace_seconds: float = 1.0
     contact_rotation_min_contacts: int = 2
+    stable_rotation_min_contacts: int = 3
+    target_angvel: float = 0.20
+    target_angvel_tolerance: float = 0.20
+    stable_center_radius: float = 0.018
+    stable_ball_linvel_max: float = 0.05
+    ball_center_xy_scale: float = 0.012
+    ball_center_z_scale: float = 0.010
+    ball_center_penalty_clip: float = 25.0
+    recovery_activation_distance: float = 0.003
+    recovery_progress_scale: float = 0.002
+    max_ball_center_distance: float = 0.050
+    max_ball_drop_from_init: float = 0.040
+    thumb_distal_q14_scale: float = 0.25
+    thumb_distal_q15_scale: float = 0.20
+    thumb_root_action_rate_weight: float = 0.50
+    thumb_distal_action_rate_weight: float = 1.50
 
 
 @dataclass
@@ -135,6 +151,10 @@ class DomainRandConfig:
     joint_noise: float = 0.0
     ball_vel_noise: float = 0.0
     ball_z_offset: float = 0.0
+    recovery_reset_fraction: float = 0.0
+    thumb_root_noise: float = 0.0
+    thumb_distal_noise: float = 0.0
+    ball_xy_offset: float = 0.0
 
 
 @registry.envcfg("LeapInhandRotation")
@@ -202,18 +222,29 @@ class LeapRotationDomainRandomizationProvider(DomainRandomizationProvider):
 
     def _sample_reset_state(
         self, env: Any, num_reset: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
+        """Sample actual reset states plus their nominal recovery targets."""
         dr = env.cfg.domain_rand
         grasp_cache = self._load_grasp_cache(env)
         if grasp_cache is not None:
             sample_mode = str(env.cfg.grasp_cache_sample_mode)
             if sample_mode == "random":
-                hand_qpos, ball_pos, ball_quat = sample_cached_grasps(grasp_cache, num_reset)
+                base_hand_qpos, base_ball_pos, ball_quat = sample_cached_grasps(
+                    grasp_cache, num_reset
+                )
             elif sample_mode == "sequential":
                 start = int(env._grasp_cache_cursor)
                 indices = (start + np.arange(num_reset, dtype=np.int64)) % len(grasp_cache)
                 sampled = grasp_cache[indices]
-                hand_qpos, ball_pos, ball_quat = (
+                base_hand_qpos, base_ball_pos, ball_quat = (
                     sampled[:, :16],
                     sampled[:, 16:19],
                     sampled[:, 19:23],
@@ -224,19 +255,67 @@ class LeapRotationDomainRandomizationProvider(DomainRandomizationProvider):
                     f"grasp_cache_sample_mode must be 'random' or 'sequential', got {sample_mode!r}"
                 )
         else:
-            hand_qpos = np.broadcast_to(env.default_angles, (num_reset, env._NUM_HAND_DOF)).copy()
-            hand_qpos += np.random.uniform(-dr.joint_noise, dr.joint_noise, hand_qpos.shape).astype(
-                np.float64
-            )
-            hand_qpos = np.clip(
-                hand_qpos,
-                env._ctrl_lower.astype(np.float64),
-                env._ctrl_upper.astype(np.float64),
-            )
-            ball_init_pos = env._init_qpos[env._NUM_HAND_DOF : env._NUM_HAND_DOF + 3]
-            ball_pos = np.broadcast_to(ball_init_pos, (num_reset, 3)).copy()
-            ball_pos[:, 2] += dr.ball_z_offset
+            base_hand_qpos = np.broadcast_to(
+                env.default_angles, (num_reset, env._NUM_HAND_DOF)
+            ).copy()
+            ball_init_pos = env._init_qpos[
+                env._NUM_HAND_DOF : env._NUM_HAND_DOF + 3
+            ]
+            base_ball_pos = np.broadcast_to(ball_init_pos, (num_reset, 3)).copy()
             ball_quat = np.tile([1.0, 0.0, 0.0, 0.0], (num_reset, 1))
+
+        nominal_hand_qpos = np.asarray(base_hand_qpos, dtype=np.float64).copy()
+        nominal_ball_pos = np.asarray(base_ball_pos, dtype=np.float64).copy()
+        nominal_ball_pos[:, 2] += float(dr.ball_z_offset)
+
+        hand_qpos = nominal_hand_qpos.copy()
+        ball_pos = nominal_ball_pos.copy()
+
+        # Generic cache-neighborhood noise. Keep the nominal state unchanged so
+        # ball-center and posture rewards still point back to the stable seed.
+        if float(dr.joint_noise) > 0.0:
+            hand_qpos += np.random.uniform(
+                -float(dr.joint_noise),
+                float(dr.joint_noise),
+                hand_qpos.shape,
+            )
+
+        recovery_fraction = float(dr.recovery_reset_fraction)
+        if not 0.0 <= recovery_fraction <= 1.0:
+            raise ValueError(
+                "domain_rand.recovery_reset_fraction must be between 0 and 1"
+            )
+        recovery_mask = np.random.random(num_reset) < recovery_fraction
+        num_recovery = int(np.sum(recovery_mask))
+        if num_recovery > 0:
+            # LEAP thumb chain is q12 -> q13 -> q14 -> q15.  The first two
+            # joints reposition the whole thumb; the last two only fine-tune
+            # the contact surface.
+            root_noise = float(dr.thumb_root_noise)
+            distal_noise = float(dr.thumb_distal_noise)
+            xy_offset = float(dr.ball_xy_offset)
+            if min(root_noise, distal_noise, xy_offset) < 0.0:
+                raise ValueError(
+                    "thumb recovery noise magnitudes must be non-negative"
+                )
+            if root_noise > 0.0:
+                hand_qpos[recovery_mask, 12:14] += np.random.uniform(
+                    -root_noise, root_noise, (num_recovery, 2)
+                )
+            if distal_noise > 0.0:
+                hand_qpos[recovery_mask, 14:16] += np.random.uniform(
+                    -distal_noise, distal_noise, (num_recovery, 2)
+                )
+            if xy_offset > 0.0:
+                ball_pos[recovery_mask, :2] += np.random.uniform(
+                    -xy_offset, xy_offset, (num_recovery, 2)
+                )
+
+        hand_qpos = np.clip(
+            hand_qpos,
+            env._ctrl_lower.astype(np.float64),
+            env._ctrl_upper.astype(np.float64),
+        )
 
         qvel = np.zeros((num_reset, env.nv), dtype=np.float64)
         qvel[:, env._NUM_HAND_DOF : env._NUM_HAND_DOF + 3] = np.random.uniform(
@@ -244,7 +323,15 @@ class LeapRotationDomainRandomizationProvider(DomainRandomizationProvider):
             dr.ball_vel_noise,
             (num_reset, 3),
         )
-        return hand_qpos, ball_pos, ball_quat, qvel
+        return (
+            hand_qpos,
+            ball_pos,
+            np.asarray(ball_quat, dtype=np.float64),
+            qvel,
+            nominal_hand_qpos,
+            nominal_ball_pos,
+            recovery_mask,
+        )
 
     def _build_info_updates(
         self,
@@ -252,19 +339,29 @@ class LeapRotationDomainRandomizationProvider(DomainRandomizationProvider):
         hand_qpos: np.ndarray,
         ball_pos: np.ndarray,
         ball_quat: np.ndarray,
+        nominal_hand_qpos: np.ndarray,
+        nominal_ball_pos: np.ndarray,
+        recovery_mask: np.ndarray,
     ) -> dict[str, np.ndarray]:
         num_reset = hand_qpos.shape[0]
         dtype = get_global_dtype()
 
         init_ctrl = np.asarray(hand_qpos, dtype=dtype)
-        init_ball_pos = np.asarray(ball_pos, dtype=dtype)
+        actual_ball_pos = np.asarray(ball_pos, dtype=dtype)
+        nominal_ctrl = np.asarray(nominal_hand_qpos, dtype=dtype)
+        init_ball_pos = np.asarray(nominal_ball_pos, dtype=dtype)
+        center_error = np.linalg.norm(actual_ball_pos - init_ball_pos, axis=1).astype(dtype)
         info_updates = {
             "current_actions": zero_actions(num_reset, env._num_action),
             "last_actions": zero_actions(num_reset, env._num_action),
             "prev_ctrl": init_ctrl,
-            "init_pose": init_ctrl.copy(),
+            "init_pose": nominal_ctrl.copy(),
             "prev_dof_pos": init_ctrl.copy(),
-            "prev_ball_pos": init_ball_pos.copy(),
+            "prev_ball_pos": actual_ball_pos.copy(),
+            "init_ball_pos": init_ball_pos.copy(),
+            "prev_center_error": center_error.copy(),
+            "curr_center_error": center_error.copy(),
+            "recovery_reset": np.asarray(recovery_mask, dtype=dtype),
             "prev_ball_quat": np.asarray(ball_quat, dtype=dtype).copy(),
             "prev_ball_linvel": np.zeros((num_reset, 3), dtype=dtype),
             "prev_ball_angvel": np.zeros((num_reset, 3), dtype=dtype),
@@ -281,7 +378,7 @@ class LeapRotationDomainRandomizationProvider(DomainRandomizationProvider):
             ),
             "rotation_window_sum": np.zeros(num_reset, dtype=dtype),
         }
-        init_obs = env._build_current_obs(info_updates, init_ctrl, init_ball_pos)
+        init_obs = env._build_current_obs(info_updates, init_ctrl, actual_ball_pos)
         info_updates["obs_lag_history"] = build_obs_lag_history(
             init_obs, env._NUM_LAG_STEPS, env._NUM_OBS_PER_STEP
         )
@@ -289,9 +386,25 @@ class LeapRotationDomainRandomizationProvider(DomainRandomizationProvider):
 
     def build_reset_plan(self, env: Any, env_ids: np.ndarray) -> ResetPlan:
         num_reset = len(env_ids)
-        hand_qpos, ball_pos, ball_quat, qvel = self._sample_reset_state(env, num_reset)
+        (
+            hand_qpos,
+            ball_pos,
+            ball_quat,
+            qvel,
+            nominal_hand_qpos,
+            nominal_ball_pos,
+            recovery_mask,
+        ) = self._sample_reset_state(env, num_reset)
         qpos = np.concatenate([hand_qpos, ball_pos, ball_quat], axis=1, dtype=np.float64)
-        info_updates = self._build_info_updates(env, hand_qpos, ball_pos, ball_quat)
+        info_updates = self._build_info_updates(
+            env,
+            hand_qpos,
+            ball_pos,
+            ball_quat,
+            nominal_hand_qpos,
+            nominal_ball_pos,
+            recovery_mask,
+        )
 
         return ResetPlan(
             env_ids=env_ids,
@@ -343,8 +456,8 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
     )
     _reward_cfg: RewardConfigPPO
 
-    # 每幀 = 16 joint positions + 16 targets + 3 ball position。
-    _NUM_OBS_PER_STEP = 60
+    # 每幀含球心相對 nominal seed 的 3-D 誤差，共 63 維。
+    _NUM_OBS_PER_STEP = 63
     _INCLUDE_FINGERTIP_CONTACT_OBS = True
     _INCLUDE_BALL_ANGVEL_OBS = True
     _INCLUDE_ROTATION_PHASE_OBS = True
@@ -412,6 +525,13 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
             "stall": self._reward_stall,
             "contact_rotation": self._reward_contact_rotation,
             "window_rotation": self._reward_window_rotation,
+            "stable_rotation": self._reward_stable_rotation,
+            "thumb_contact": self._reward_thumb_contact,
+            "support_contact": self._reward_support_contact,
+            "ball_center": self._reward_ball_center,
+            "center_recovery": self._reward_center_recovery,
+            "action_rate": self._reward_action_rate,
+            "thumb_distal_posture": self._reward_thumb_distal_posture,
             "palm_contact": self._reward_palm_contact,
             "obj_linvel": self._reward_obj_linvel,
             "pose_diff": self._reward_pose_diff,
@@ -507,8 +627,11 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
         signed_angvel = np.clip(ball_angvel @ self._rot_axis, 0.0, self._reward_cfg.angvel_clip_max)
         contacts = np.asarray(info["curr_fingertip_contacts"])
         contact_gate = np.asarray(
-            np.sum(contacts, axis=1)
-            >= float(self._reward_cfg.contact_rotation_min_contacts),
+            (contacts[:, 3] > 0.5)
+            & (
+                np.sum(contacts > 0.5, axis=1)
+                >= int(self._reward_cfg.contact_rotation_min_contacts)
+            ),
             dtype=get_global_dtype(),
         )
         return self._rotation_reward_active(info, signed_angvel * contact_gate)
@@ -522,6 +645,126 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
         )
         reward = np.clip(average_angvel, 0.0, self._reward_cfg.angvel_clip_max)
         return self._rotation_reward_active(info, reward)
+
+    def _reward_stable_rotation(
+        self, info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+    ) -> np.ndarray:
+        del dof_pos, dof_vel, torques
+        signed_angvel = ball_angvel @ self._rot_axis
+        target = float(self._reward_cfg.target_angvel)
+        tolerance = float(self._reward_cfg.target_angvel_tolerance)
+        if tolerance <= 0.0:
+            raise ValueError("reward.target_angvel_tolerance must be positive")
+        speed_reward = np.clip(
+            1.0 - np.abs(signed_angvel - target) / tolerance,
+            0.0,
+            1.0,
+        )
+
+        contacts = np.asarray(info["curr_fingertip_contacts"])
+        contact_count = np.sum(contacts > 0.5, axis=1)
+        thumb_contact = contacts[:, 3] > 0.5
+        center_error = np.linalg.norm(
+            ball_pos - np.asarray(info["init_ball_pos"]), axis=1
+        )
+        linvel_ok = (
+            np.linalg.norm(ball_linvel, axis=1)
+            <= float(self._reward_cfg.stable_ball_linvel_max)
+        )
+        stable_gate = (
+            thumb_contact
+            & (contact_count >= int(self._reward_cfg.stable_rotation_min_contacts))
+            & (center_error <= float(self._reward_cfg.stable_center_radius))
+            & linvel_ok
+            & ~terminated
+        )
+        return self._rotation_reward_active(
+            info, speed_reward * stable_gate.astype(get_global_dtype())
+        )
+
+    def _reward_thumb_contact(
+        self, info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+    ) -> np.ndarray:
+        del dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques
+        contacts = np.asarray(info["curr_fingertip_contacts"])
+        return np.asarray((contacts[:, 3] > 0.5) & ~terminated, dtype=get_global_dtype())
+
+    def _reward_support_contact(
+        self, info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+    ) -> np.ndarray:
+        del dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques
+        contacts = np.asarray(info["curr_fingertip_contacts"])
+        support = (contacts[:, 3] > 0.5) & (
+            np.sum(contacts > 0.5, axis=1)
+            >= int(self._reward_cfg.stable_rotation_min_contacts)
+        )
+        return np.asarray(support & ~terminated, dtype=get_global_dtype())
+
+    def _reward_ball_center(
+        self, info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+    ) -> np.ndarray:
+        del dof_pos, dof_vel, ball_linvel, ball_angvel, torques, terminated
+        center_error = ball_pos - np.asarray(info["init_ball_pos"])
+        xy_scale = float(self._reward_cfg.ball_center_xy_scale)
+        z_scale = float(self._reward_cfg.ball_center_z_scale)
+        if xy_scale <= 0.0 or z_scale <= 0.0:
+            raise ValueError("ball-center reward scales must be positive")
+        penalty = np.square(np.linalg.norm(center_error[:, :2], axis=1) / xy_scale)
+        penalty += np.square(np.abs(center_error[:, 2]) / z_scale)
+        return np.asarray(
+            np.clip(penalty, 0.0, float(self._reward_cfg.ball_center_penalty_clip)),
+            dtype=get_global_dtype(),
+        )
+
+    def _reward_center_recovery(
+        self, info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+    ) -> np.ndarray:
+        del dof_pos, dof_vel, ball_linvel, ball_angvel, torques
+        current_error = np.linalg.norm(
+            ball_pos - np.asarray(info["init_ball_pos"]), axis=1
+        )
+        previous_error = np.asarray(info.get("prev_center_error", current_error))
+        progress_scale = float(self._reward_cfg.recovery_progress_scale)
+        if progress_scale <= 0.0:
+            raise ValueError("reward.recovery_progress_scale must be positive")
+        progress = np.clip(
+            (previous_error - current_error) / progress_scale, -1.0, 1.0
+        )
+        contacts = np.asarray(info["curr_fingertip_contacts"])
+        active = (
+            (contacts[:, 3] > 0.5)
+            & (current_error >= float(self._reward_cfg.recovery_activation_distance))
+            & ~terminated
+        )
+        return np.asarray(progress * active, dtype=get_global_dtype())
+
+    def _reward_action_rate(
+        self, info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+    ) -> np.ndarray:
+        del dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+        current = np.asarray(info["current_actions"])
+        previous = np.asarray(info["last_actions"])
+        weights = np.ones((current.shape[1],), dtype=get_global_dtype())
+        # q12/q13 may reposition the whole thumb; q14/q15 are kept quieter.
+        weights[12:14] = float(self._reward_cfg.thumb_root_action_rate_weight)
+        weights[14:16] = float(self._reward_cfg.thumb_distal_action_rate_weight)
+        return np.asarray(
+            np.mean(np.square(current - previous) * weights[None, :], axis=1),
+            dtype=get_global_dtype(),
+        )
+
+    def _reward_thumb_distal_posture(
+        self, info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+    ) -> np.ndarray:
+        del dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+        reference = np.asarray(info["init_pose"])
+        q14_scale = float(self._reward_cfg.thumb_distal_q14_scale)
+        q15_scale = float(self._reward_cfg.thumb_distal_q15_scale)
+        if q14_scale <= 0.0 or q15_scale <= 0.0:
+            raise ValueError("thumb distal posture scales must be positive")
+        q14_penalty = np.square((dof_pos[:, 14] - reference[:, 14]) / q14_scale)
+        q15_penalty = np.square((dof_pos[:, 15] - reference[:, 15]) / q15_scale)
+        return np.asarray(q14_penalty + q15_penalty, dtype=get_global_dtype())
 
     @staticmethod
     def _contact_flag(sensor_data: np.ndarray) -> np.ndarray:
@@ -647,6 +890,10 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
             self.get_fingertip_pos() - ball_pos[:, None, :],
             dtype=get_global_dtype(),
         )
+        current_center_error = np.linalg.norm(
+            ball_pos - np.asarray(state.info["init_ball_pos"]), axis=1
+        ).astype(get_global_dtype())
+        state.info["curr_center_error"] = current_center_error.copy()
         previous_contact_steps = np.asarray(
             state.info.get("contact_duration_steps", np.zeros_like(contacts))
         )
@@ -661,8 +908,23 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
                 np.zeros(self._num_envs, dtype=np.uint32),
             )
         )
+        stable_support = (contacts[:, 3] > 0.5) & (
+            np.sum(contacts > 0.5, axis=1)
+            >= int(self._reward_cfg.stable_rotation_min_contacts)
+        )
+        stable_center = current_center_error <= float(self._reward_cfg.stable_center_radius)
+        stable_linvel = (
+            np.linalg.norm(ball_linvel, axis=1)
+            <= float(self._reward_cfg.stable_ball_linvel_max)
+        )
         state.info["rotation_streak_steps"] = np.where(
-            signed_angvel >= float(getattr(self._reward_cfg, "minimum_positive_angvel", 0.15)),
+            (
+                signed_angvel
+                >= float(getattr(self._reward_cfg, "minimum_positive_angvel", 0.15))
+            )
+            & stable_support
+            & stable_center
+            & stable_linvel,
             previous_streak + 1,
             0,
         ).astype(np.uint32)
@@ -705,12 +967,20 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
             kp=self._cfg.control_config.kp,
             kd=self._cfg.control_config.kd,
         )
-        terminated = ball_pos[:, 2] < self._reward_cfg.reset_z_threshold
+        init_ball_pos = np.asarray(state.info["init_ball_pos"])
+        center_distance = np.linalg.norm(ball_pos - init_ball_pos, axis=1)
+        drop_from_init = init_ball_pos[:, 2] - ball_pos[:, 2]
+        terminated = (
+            (ball_pos[:, 2] < self._reward_cfg.reset_z_threshold)
+            | (center_distance > float(self._reward_cfg.max_ball_center_distance))
+            | (drop_from_init > float(self._reward_cfg.max_ball_drop_from_init))
+        )
 
         reward = self._compute_reward(
             state.info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
         )
         obs = self._compute_obs(state.info, dof_pos, ball_pos)
+        state.info["prev_center_error"] = current_center_error.copy()
         return state.replace(obs=obs, reward=reward, terminated=terminated)
 
     def _compute_reward(
@@ -764,7 +1034,13 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
                 * noise_cfg.scale_joint_angle
             )
 
-        obs_parts = [dof_pos_norm, targets, ball_pos.astype(dtype)]
+        ball_center_error = ball_pos - np.asarray(info["init_ball_pos"], dtype=dtype)
+        obs_parts = [
+            dof_pos_norm,
+            targets,
+            ball_pos.astype(dtype),
+            ball_center_error.astype(dtype),
+        ]
         if self._INCLUDE_FINGERTIP_CONTACT_OBS:
             obs_parts.append(
                 np.asarray(

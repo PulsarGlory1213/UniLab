@@ -2,7 +2,7 @@
 training:
   task_name: LeapInhandRotation
   sim_backend: mujoco
-  play_steps: 200
+  play_steps: 400
   render_spacing: 0.5
   cam_distance: 0.45
   cam_lookat: [0.0, 0.0, 0.52]
@@ -15,30 +15,31 @@ training:
   replay_queue_size: 4
   checkpoint_video:
     enabled: true
-    play_steps: 200
+    play_steps: 400
     play_env_num: 1
     output_subdir: videos
+
 algo:
   num_envs: 1024
-  steps_per_env: 8
-  max_iterations: 600
+  steps_per_env: 64
+  max_iterations: 1000
   save_interval: 50
   algorithm:
     value_loss_coef: 4.0
-    entropy_coef: 0.002
+    entropy_coef: 0.003
     entropy_coef_schedule:
-      initial: 0.002
-      final: 0.0
+      initial: 0.003
+      final: 0.0005
       start_iteration: 0
-      end_iteration: 600
+      end_iteration: 800
     action_std_schedule:
-      initial: 0.5
-      final: 0.15
+      initial: 0.35
+      final: 0.12
       start_iteration: 0
-      end_iteration: 600
-      min_std: 0.10
-      max_std: 0.60
-    learning_rate: 0.001
+      end_iteration: 1000
+      min_std: 0.08
+      max_std: 0.40
+    learning_rate: 0.0003
     desired_kl: 0.02
     adaptive_kl_factor: 2.0
     adaptive_lr_factor: 1.5
@@ -56,36 +57,86 @@ algo:
     obs_normalization: true
     distribution_cfg:
       class_name: rsl_rl.modules.distribution.GaussianDistribution
-      init_std: 0.5
+      init_std: 0.25
       std_type: scalar
   critic:
     hidden_dims: [512, 256, 128]
     activation: elu
     obs_normalization: true
+
 reward:
   scales:
-    rotate: 2.0
-    reverse_rotate: -6.0
-    rotation_streak: 1.0
-    stall: -0.25
-    contact_rotation: 2.0
-    window_rotation: 2.0
-    palm_contact: -0.5
-    obj_linvel: -0.5
-    pose_diff: 0.0
+    # 主要任務：真正產生穩定正向旋轉
+    stable_rotation: 6.0
+    rotation_streak: 0.5
+    stall: -1.0
+
+    # 接觸只作為輕微輔助，不再讓「靜止握住」成為主要得分來源
+    thumb_contact: 0.10
+    support_contact: 0.15
+
+    # 保留球心穩定，但不要壓制所有必要的小幅位移
+    ball_center: -2.5
+    center_recovery: 1.0
+    obj_linvel: -0.4
+
+    # 動作平順，但不能把手指鎖死
+    action_rate: -0.008
+    thumb_distal_posture: -0.02
+
+    palm_contact: -1.0
+    reverse_rotate: -4.0
+    drop: -50.0
     torque: -0.001
     work: -0.0001
-    drop: -10.0
+
+    rotate: 0.0
+    contact_rotation: 0.0
+    window_rotation: 0.0
+    pose_diff: 0.0
+
   angvel_clip_min: 0.0
-  angvel_clip_max: 0.6
+  angvel_clip_max: 0.8
   reverse_angvel_clip_max: 1.0
-  minimum_positive_angvel: 0.10
+
+  # 0.30 rad/s：一圈約 21 秒，已經能明顯看到旋轉
+  target_angvel: 0.30
+
+  # 必須 <= target，才能保證完全不轉時 reward 為 0
+  target_angvel_tolerance: 0.30
+  minimum_positive_angvel: 0.05
+
   rotation_window_seconds: 1.0
   rotation_streak_target_seconds: 2.0
-  stall_grace_seconds: 1.5
+  stall_grace_seconds: 1.0
+
+  # 允許拇指 + 任一手指的兩指支撐階段
+  stable_rotation_min_contacts: 2
   contact_rotation_min_contacts: 2
+
+  # 稍微放寬球心與線速度，讓球能在指間滾動
+  stable_center_radius: 0.025
+  stable_ball_linvel_max: 0.08
+
+  ball_center_xy_scale: 0.018
+  ball_center_z_scale: 0.015
+  ball_center_penalty_clip: 16.0
+
+  recovery_activation_distance: 0.004
+  recovery_progress_scale: 0.003
+
+  max_ball_center_distance: 0.050
+  max_ball_drop_from_init: 0.040
   reset_z_threshold: 0.54
-  rotation_warmup_seconds: 0.5
+
+  # 不需要等完整一秒才開始學旋轉
+  rotation_warmup_seconds: 0.25
+
+  thumb_distal_q14_scale: 0.30
+  thumb_distal_q15_scale: 0.25
+  thumb_root_action_rate_weight: 0.50
+  thumb_distal_action_rate_weight: 1.25
+
 env:
   gen_grasp: false
   use_grasp_cache: true
@@ -95,20 +146,44 @@ env:
   rotation_axis: [0.0, 0.0, 1.0]
   rotation_cycle_seconds: 2.0
   ctrl_dt: 0.02
+
   control_config:
-    action_scale: 0.020
+    # Actuator order is [1,0,2,3, 5,4,6,7, 9,8,10,11, 12,13,14,15].
+    # The final four are the thumb chain q12 -> q13 -> q14 -> q15.
+    # q12/q13 move the whole thumb; q14/q15 only fine-tune the contact surface.
+    action_scale:
+      [
+        0.018, 0.018, 0.018, 0.016,
+        0.018, 0.018, 0.018, 0.016,
+        0.018, 0.018, 0.018, 0.016,
+        0.030, 0.028, 0.014, 0.010
+      ]
     target_mode: bounded_incremental
-    target_offset_limit: 0.30
+    target_offset_limit:
+      [
+        0.30, 0.30, 0.30, 0.28,
+        0.30, 0.30, 0.30, 0.28,
+        0.30, 0.30, 0.30, 0.28,
+        0.45, 0.40, 0.22, 0.18
+      ]
     kp: 20.0
     kd: 1.5
+
   noise_config:
     level: 0.0
     scale_joint_angle: 0.02
+
   domain_rand:
+    recovery_reset_fraction: 0.25
+    thumb_root_noise: 0.05
+    thumb_distal_noise: 0.015
+    ball_xy_offset: 0.002
+
+    joint_noise: 0.0
+    ball_vel_noise: 0.0
+    ball_z_offset: 0.0
+
     randomize_base_mass: false
     random_com: false
     randomize_gravity: false
     push_robots: false
-    joint_noise: 0.0
-    ball_vel_noise: 0.0
-    ball_z_offset: 0.0
