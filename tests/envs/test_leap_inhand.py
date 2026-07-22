@@ -233,17 +233,29 @@ def test_leap_scene_preserves_fixed_hand_object_layout() -> None:
     ]
     assert actuator_qpos_addresses == list(range(16))
     expected_hand_qpos = [
-        1.205147, -0.605767, 0.230668, 0.681022,
-        0.746191, -0.097833, 0.936544, 0.076832,
-        1.477715, -0.450996, -0.013916, 0.105753,
-        1.695646, 0.269985, 0.360451, -0.071177,
+        0.675558466,
+        -0.311245401,
+        1.28696011,
+        0.481546183,
+        1.1454015,
+        0.0429715889,
+        0.0624296905,
+        0.440274799,
+        1.60076238,
+        -0.184116801,
+        0.00624721579,
+        0.743162204,
+        1.40099437,
+        1.32970657,
+        0.528728303,
+        0.312199124,
     ]
     assert model.key_qpos[0, :16].tolist() == pytest.approx(expected_hand_qpos)
     assert model.key_qpos[0, 16:19].tolist() == pytest.approx(
-        [-0.013583, -0.002142, 0.633196]
+        [-0.0225964729, 0.021169898, 0.639558165]
     )
     assert model.key_qpos[0, 19:23].tolist() == pytest.approx(
-        [0.994792, 0.085251, 0.044022, 0.034399]
+        [0.999573468, -0.0156558521, -0.0229829881, 0.00891954799]
     )
     home_qpos = model.key_qpos[0, :16]
     lower_clearance = home_qpos - model.actuator_ctrlrange[:, 0]
@@ -259,8 +271,6 @@ def test_leap_scene_preserves_fixed_hand_object_layout() -> None:
     assert 'builtin="checker"' in scene_source
     assert "leap_th_contact" in scene_source
     assert "leap_rotation_palm_contact" in scene_source
-
-
 
 
 def test_leap_grasp_cache_contract_rejects_invalid_arrays() -> None:
@@ -304,7 +314,7 @@ def test_leap_task_owns_robot_specific_names() -> None:
         "fingertip_3",
         "thumb_fingertip",
     )
-    assert LeapInhandRotationEnv._NUM_OBS_PER_STEP == 44
+    assert LeapInhandRotationEnv._NUM_OBS_PER_STEP == 60
 
 
 def test_leap_default_offset_actions_stay_centered_on_reset_grasp() -> None:
@@ -337,6 +347,7 @@ def test_leap_default_offset_actions_stay_centered_on_reset_grasp() -> None:
 
     np.testing.assert_allclose(moved, [[0.75, -0.75]])
     np.testing.assert_allclose(centered, [[0.5, -0.5]])
+
 
 def test_leap_bounded_incremental_actions_accumulate_without_leaving_grasp_window() -> None:
     from types import SimpleNamespace
@@ -373,6 +384,7 @@ def test_leap_bounded_incremental_actions_accumulate_without_leaving_grasp_windo
     np.testing.assert_allclose(first, [[0.7, -0.7]])
     np.testing.assert_allclose(second, [[0.7, -0.7]])
 
+
 def test_leap_rotation_reward_ignores_reset_contact_relaxation() -> None:
     from types import SimpleNamespace
 
@@ -401,6 +413,7 @@ def test_leap_rotation_reward_ignores_reset_contact_relaxation() -> None:
 
     np.testing.assert_allclose(reward, [0.0, 0.5])
 
+
 def test_leap_reverse_rotation_reward_penalizes_only_wrong_direction() -> None:
     from types import SimpleNamespace
 
@@ -428,6 +441,56 @@ def test_leap_reverse_rotation_reward_penalizes_only_wrong_direction() -> None:
 
     np.testing.assert_allclose(reward, [0.0, 0.5])
 
+
+def test_leap_sustained_rotation_terms_reward_contacted_progress() -> None:
+    from types import SimpleNamespace
+
+    from unilab.envs.manipulation.leap_inhand.rotation import LeapInhandRotationEnv
+
+    env = object.__new__(LeapInhandRotationEnv)
+    env._cfg = SimpleNamespace(ctrl_dt=0.02)
+    env._rot_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    env._reward_cfg = SimpleNamespace(
+        angvel_clip_max=1.5,
+        rotation_warmup_seconds=0.0,
+        minimum_positive_angvel=0.15,
+        rotation_streak_target_seconds=2.0,
+        rotation_window_seconds=1.0,
+        stall_grace_seconds=1.0,
+        contact_rotation_min_contacts=2,
+    )
+    zeros3 = np.zeros((2, 3), dtype=np.float32)
+    zeros16 = np.zeros((2, 16), dtype=np.float32)
+    angvel = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]], dtype=np.float32)
+    info = {
+        "steps": np.array([100, 100], dtype=np.uint32),
+        "rotation_streak_steps": np.array([50, 0], dtype=np.uint32),
+        "rotation_window_sum": np.array([0.8, -0.2], dtype=np.float32),
+        "curr_fingertip_contacts": np.array(
+            [[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 0.0]], dtype=np.float32
+        ),
+    }
+    terminated = np.zeros(2, dtype=bool)
+
+    rotate = env._reward_rotate(info, zeros16, zeros16, zeros3, zeros3, angvel, zeros16, terminated)
+    contact = env._reward_contact_rotation(
+        info, zeros16, zeros16, zeros3, zeros3, angvel, zeros16, terminated
+    )
+    streak = env._reward_rotation_streak(
+        info, zeros16, zeros16, zeros3, zeros3, angvel, zeros16, terminated
+    )
+    window = env._reward_window_rotation(
+        info, zeros16, zeros16, zeros3, zeros3, angvel, zeros16, terminated
+    )
+    stall = env._reward_stall(info, zeros16, zeros16, zeros3, zeros3, angvel, zeros16, terminated)
+
+    np.testing.assert_allclose(rotate, [1.0, 0.0])
+    np.testing.assert_allclose(contact, [1.0, 0.0])
+    np.testing.assert_allclose(streak, [0.5, 0.0])
+    np.testing.assert_allclose(window, [0.8, 0.0])
+    np.testing.assert_allclose(stall, [0.0, 1.0])
+
+
 def test_leap_appo_owner_config_composes() -> None:
     config_dir = Path(__file__).resolve().parents[2] / "conf" / "appo"
 
@@ -440,8 +503,8 @@ def test_leap_appo_owner_config_composes() -> None:
     assert cfg.algo.steps_per_env == 8
     assert cfg.algo.algorithm.learning_rate == 0.001
     assert cfg.algo.algorithm.desired_kl == 0.02
-    assert cfg.algo.algorithm.entropy_coef == 0.005
-    assert cfg.algo.actor.distribution_cfg.init_std == 1.0
+    assert cfg.algo.algorithm.entropy_coef == 0.002
+    assert cfg.algo.actor.distribution_cfg.init_std == 0.5
     assert cfg.env.rotation_axis == [0.0, 0.0, 1.0]
     assert cfg.env.rotation_cycle_seconds == pytest.approx(2.0)
     assert cfg.env.gen_grasp is False
@@ -451,16 +514,20 @@ def test_leap_appo_owner_config_composes() -> None:
     assert cfg.env.control_config.kp == 20.0
     assert cfg.env.control_config.kd == 1.5
     assert cfg.reward.reset_z_threshold == pytest.approx(0.54)
-    assert cfg.reward.rotation_warmup_seconds == pytest.approx(1.0)
+    assert cfg.reward.rotation_warmup_seconds == pytest.approx(0.0)
     assert dict(cfg.reward.scales) == {
-        "rotate": 5.0,
-        "reverse_rotate": -5.0,
-        "palm_contact": -0.25,
+        "rotate": 3.0,
+        "reverse_rotate": -8.0,
+        "rotation_streak": 1.0,
+        "stall": -0.5,
+        "contact_rotation": 2.0,
+        "window_rotation": 2.0,
+        "palm_contact": -0.5,
         "obj_linvel": -0.3,
-        "pose_diff": -0.03,
-        "torque": -0.01,
-        "work": -0.001,
-        "drop": -5.0,
+        "pose_diff": 0.0,
+        "torque": -0.001,
+        "work": -0.0001,
+        "drop": -10.0,
     }
     assert cfg.training.checkpoint_video.enabled is True
     assert cfg.training.play_env_num == 1
@@ -480,27 +547,31 @@ def test_leap_appo_motrix_owner_preserves_cross_backend_contract() -> None:
     assert cfg.training.task_name == "LeapInhandRotation"
     assert cfg.training.sim_backend == "motrix"
     assert cfg.algo.actor.hidden_dims == [512, 256, 128]
-    assert cfg.algo.algorithm.entropy_coef == 0.005
-    assert cfg.algo.actor.distribution_cfg.init_std == 1.0
+    assert cfg.algo.algorithm.entropy_coef == 0.002
+    assert cfg.algo.actor.distribution_cfg.init_std == 0.5
     assert cfg.env.control_config.action_scale == pytest.approx(1.0 / 24.0)
     assert cfg.env.control_config.target_mode == "incremental"
-    assert cfg.env.use_grasp_cache is False
+    assert cfg.env.use_grasp_cache is True
     assert cfg.env.rotation_axis == [0.0, 0.0, 1.0]
     assert cfg.env.rotation_cycle_seconds == pytest.approx(2.0)
     assert cfg.reward.reset_z_threshold == pytest.approx(0.54)
-    assert cfg.reward.rotation_warmup_seconds == pytest.approx(1.0)
+    assert cfg.reward.rotation_warmup_seconds == pytest.approx(0.0)
     owner_text = (config_dir / "task" / "leap_inhand" / "motrix.yaml").read_text(encoding="utf-8")
     assert "defaults:" not in owner_text
     assert "/task/leap_inhand/mujoco" not in owner_text
     assert dict(cfg.reward.scales) == {
-        "rotate": 5.0,
-        "reverse_rotate": -5.0,
-        "palm_contact": -0.25,
+        "rotate": 3.0,
+        "reverse_rotate": -8.0,
+        "rotation_streak": 1.0,
+        "stall": -0.5,
+        "contact_rotation": 2.0,
+        "window_rotation": 2.0,
+        "palm_contact": -0.5,
         "obj_linvel": -0.3,
-        "pose_diff": -0.03,
-        "torque": -0.01,
-        "work": -0.001,
-        "drop": -5.0,
+        "pose_diff": 0.0,
+        "torque": -0.001,
+        "work": -0.0001,
+        "drop": -10.0,
     }
 
 
@@ -741,17 +812,43 @@ def test_leap_observation_exposes_object_rotation_state() -> None:
     obs, _ = env.reset(np.array([0], dtype=np.int32))
     state = env.step(np.zeros((1, 16), dtype=np.float32))
 
-    assert obs["obs"].shape == (1, 132)
-    assert state.obs["obs"].shape == (1, 132)
-    assert env.obs_groups_spec == {"obs": 132}
-    contact_flags = state.obs["obs"][0, -9:-5]
+    assert obs["obs"].shape == (1, 180)
+    assert state.obs["obs"].shape == (1, 180)
+    assert env.obs_groups_spec == {"obs": 180}
+    contact_flags = state.obs["obs"][0, -25:-21]
     assert np.logical_or(contact_flags == 0.0, contact_flags == 1.0).all()
-    np.testing.assert_allclose(
-        state.obs["obs"][0, -5:-2], state.info["curr_ball_angvel"][0]
-    )
-    assert np.linalg.norm(state.obs["obs"][0, -2:]) == pytest.approx(1.0)
+    np.testing.assert_allclose(state.obs["obs"][0, -21:-18], state.info["curr_ball_angvel"][0])
+    assert np.linalg.norm(state.obs["obs"][0, -18:-16]) == pytest.approx(1.0)
     assert np.isfinite(state.obs["obs"]).all()
 
+
+def test_leap_rotation_partial_reset_preserves_observation_batch() -> None:
+    pytest.importorskip("mujoco")
+    from unilab.envs.manipulation.leap_inhand.rotation import (
+        LeapInhandRotationCfg,
+        LeapInhandRotationEnv,
+        RewardConfigPPO,
+    )
+
+    reward = RewardConfigPPO(
+        scales={"rotate": 1.0},
+        angvel_clip_min=0.0,
+        angvel_clip_max=1.5,
+        reset_z_threshold=0.54,
+    )
+    env = LeapInhandRotationEnv(
+        LeapInhandRotationCfg(reward_config=reward),
+        num_envs=4,
+        backend_type="mujoco",
+    )
+
+    env.init_state()
+    obs, _ = env.reset(np.array([2], dtype=np.int32))
+
+    assert obs["obs"].shape == (1, 180)
+    assert env.state is not None
+    assert env.state.obs["obs"].shape == (4, 180)
+    assert np.isfinite(obs["obs"]).all()
 
 def test_leap_rotation_uses_owned_grasp_and_allegro_reward_terms() -> None:
     pytest.importorskip("mujoco")
@@ -776,6 +873,7 @@ def test_leap_rotation_uses_owned_grasp_and_allegro_reward_terms() -> None:
         reset_z_threshold=0.48,
     )
     cfg = LeapInhandRotationCfg(reward_config=reward)
+    cfg.use_grasp_cache = False
     cfg.domain_rand.joint_noise = 0.0
     cfg.domain_rand.ball_vel_noise = 0.0
     env = LeapInhandRotationEnv(cfg, num_envs=1, backend_type="mujoco")
@@ -813,8 +911,8 @@ def test_leap_motrix_reset_step_has_finite_observation() -> None:
     obs, _ = env.reset(np.array([0, 1], dtype=np.int32))
     state = env.step(np.zeros((2, 16), dtype=np.float32))
 
-    assert obs["obs"].shape == (2, 132)
-    assert state.obs["obs"].shape == (2, 132)
+    assert obs["obs"].shape == (2, 180)
+    assert state.obs["obs"].shape == (2, 180)
     assert np.isfinite(state.obs["obs"]).all()
     assert np.isfinite(env._ctrl_lower).all()
     assert np.isfinite(env._ctrl_upper).all()
@@ -1123,7 +1221,7 @@ def test_leap_ball_catch_partial_reset_preserves_observation_batch() -> None:
         num_envs=4,
         backend_type="motrix",
     )
-    env.reset(np.arange(4, dtype=np.int32))
+    env.init_state()
 
     obs, _ = env.reset(np.asarray([2], dtype=np.int32))
 

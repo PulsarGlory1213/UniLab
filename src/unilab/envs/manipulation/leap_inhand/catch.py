@@ -448,6 +448,8 @@ class LeapBallCatchEnv(LeapInhandRotationEnv):
     _INCLUDE_FINGERTIP_CONTACT_OBS = False
     _INCLUDE_BALL_ANGVEL_OBS = False
     _INCLUDE_ROTATION_PHASE_OBS = False
+    _INCLUDE_FINGERTIP_REL_OBS = False
+    _INCLUDE_CONTACT_DURATION_OBS = False
     # 這四個 sensor 名稱來自 scene_ball_catch.xml，順序是食指/中指/無名指/大拇指。
     _CONTACT_SENSORS = (
         "leap_ff_contact",

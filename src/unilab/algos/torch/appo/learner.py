@@ -152,6 +152,8 @@ class APPOLearner:
         lam: float = 0.95,
         value_loss_coef: float = 1.0,
         entropy_coef: float = 0.01,
+        action_std_schedule: dict[str, float] | None = None,
+        entropy_coef_schedule: dict[str, float] | None = None,
         learning_rate: float = 1e-3,
         max_grad_norm: float = 1.0,
         use_clipped_value_loss: bool = True,
@@ -189,6 +191,8 @@ class APPOLearner:
         self.num_mini_batches = num_mini_batches
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
+        self.action_std_schedule = action_std_schedule
+        self.entropy_coef_schedule = entropy_coef_schedule
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
@@ -221,6 +225,43 @@ class APPOLearner:
         self._minibatch_loss_fn = self._minibatch_loss_tensors
         if self.enable_compile:
             self._compile_training_methods()
+
+    @staticmethod
+    def _scheduled_value(schedule: dict[str, float], iteration: int, total: int) -> float:
+        start = int(schedule.get("start_iteration", 0))
+        end = int(schedule.get("end_iteration", total))
+        initial = float(schedule["initial"])
+        final = float(schedule["final"])
+        if end <= start:
+            raise ValueError("schedule end_iteration must be greater than start_iteration")
+        progress = min(max((iteration - start) / (end - start), 0.0), 1.0)
+        return initial + progress * (final - initial)
+
+    @staticmethod
+    def _set_actor_std(actor: Any, std: float) -> None:
+        distribution = actor.distribution
+        with torch.no_grad():
+            if distribution.std_type == "scalar":
+                distribution.std_param.fill_(std)
+            elif distribution.std_type == "log":
+                distribution.log_std_param.fill_(math.log(std))
+            else:
+                raise ValueError(f"Unsupported action std type: {distribution.std_type!r}")
+
+    def apply_training_schedules(self, iteration: int, total_iterations: int) -> None:
+        """Apply deterministic exploration and entropy schedules."""
+        if self.action_std_schedule is not None:
+            std = self._scheduled_value(self.action_std_schedule, iteration, total_iterations)
+            minimum = float(self.action_std_schedule.get("min_std", std))
+            maximum = float(self.action_std_schedule.get("max_std", std))
+            std = min(max(std, minimum), maximum)
+            self._scheduled_action_std = std
+            for actor in (self.actor, self.target_actor):
+                self._set_actor_std(actor, std)
+        if self.entropy_coef_schedule is not None:
+            self.entropy_coef = self._scheduled_value(
+                self.entropy_coef_schedule, iteration, total_iterations
+            )
 
     def _compile_training_methods(self) -> None:
         compile_fn = get_torch_compile_for_cuda(self._device_type, warn=True)
@@ -578,6 +619,19 @@ class APPOLearner:
         final_lr = float(self.learning_rate)
         self.learning_rate = final_lr
 
+        distribution = getattr(self.actor, "distribution", None)
+        if distribution is not None:
+            action_std_mean = float(
+                _distribution_std(
+                    distribution,
+                    torch.zeros((1, distribution.output_dim), device=self.device),
+                )
+                .mean()
+                .item()
+            )
+        else:
+            action_std_mean = float(self.actor.output_std.mean().item())
+
         metrics = {
             "surrogate_loss": mean_surrogate_loss / num_updates,
             "value_loss": mean_value_loss / num_updates,
@@ -586,6 +640,8 @@ class APPOLearner:
             "loss/policy_loss": mean_surrogate_loss / num_updates,
             "loss/value_loss": mean_value_loss / num_updates,
             "policy/entropy": mean_entropy / num_updates,
+            "policy/entropy_coef": float(self.entropy_coef),
+            "policy/action_std_mean": action_std_mean,
             "ppo/approx_kl": mean_target_to_current_kl / num_updates,
             "ppo/clip_fraction": mean_clip_fraction / num_updates,
             "grad/global_norm": mean_global_grad_norm / num_updates,

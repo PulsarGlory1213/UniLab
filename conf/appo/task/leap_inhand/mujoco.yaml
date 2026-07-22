@@ -21,11 +21,23 @@ training:
 algo:
   num_envs: 1024
   steps_per_env: 8
-  max_iterations: 300
+  max_iterations: 600
   save_interval: 50
   algorithm:
     value_loss_coef: 4.0
-    entropy_coef: 0.005
+    entropy_coef: 0.002
+    entropy_coef_schedule:
+      initial: 0.002
+      final: 0.0
+      start_iteration: 0
+      end_iteration: 600
+    action_std_schedule:
+      initial: 0.5
+      final: 0.15
+      start_iteration: 0
+      end_iteration: 600
+      min_std: 0.10
+      max_std: 0.60
     learning_rate: 0.001
     desired_kl: 0.02
     adaptive_kl_factor: 2.0
@@ -44,7 +56,7 @@ algo:
     obs_normalization: true
     distribution_cfg:
       class_name: rsl_rl.modules.distribution.GaussianDistribution
-      init_std: 1.0
+      init_std: 0.5
       std_type: scalar
   critic:
     hidden_dims: [512, 256, 128]
@@ -52,22 +64,32 @@ algo:
     obs_normalization: true
 reward:
   scales:
-    rotate: 5.0
-    reverse_rotate: -5.0
-    palm_contact: -0.25
+    rotate: 3.0
+    reverse_rotate: -8.0
+    rotation_streak: 1.0
+    stall: -0.5
+    contact_rotation: 2.0
+    window_rotation: 2.0
+    palm_contact: -0.5
     obj_linvel: -0.3
-    pose_diff: -0.03
-    torque: -0.01
-    work: -0.001
-    drop: -5.0
-  angvel_clip_min: -0.5
-  angvel_clip_max: 0.5
+    pose_diff: 0.0
+    torque: -0.001
+    work: -0.0001
+    drop: -10.0
+  angvel_clip_min: 0.0
+  angvel_clip_max: 1.5
+  reverse_angvel_clip_max: 2.0
+  minimum_positive_angvel: 0.15
+  rotation_window_seconds: 1.0
+  rotation_streak_target_seconds: 2.0
+  stall_grace_seconds: 1.0
+  contact_rotation_min_contacts: 2
   reset_z_threshold: 0.54
-  rotation_warmup_seconds: 1.0
+  rotation_warmup_seconds: 0.0
 env:
   gen_grasp: false
-  # Bootstrap rotation from the authored Allegro-style canonical grasp.
-  use_grasp_cache: false
+  # Reset from the replay-validated 20k stable-grasp cache.
+  use_grasp_cache: true
   max_episode_seconds: 20.0
   grasp_cache_path: caches/leap_hand_allegro_style_20k.npy
   rotation_axis: [0.0, 0.0, 1.0]

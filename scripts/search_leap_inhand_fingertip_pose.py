@@ -16,6 +16,10 @@ Finally, the best geometric candidates are simulated with MuJoCo. The output
 is the physically best settled pose, not merely the lowest kinematic score.
 The three main distal joints are also kept in a moderate Allegro-like range,
 so stability cannot be achieved by curling them to approximately 2 radians.
+The thumb is constrained to a natural LEAP opposition family instead of using
+extreme joint twist. Physical validation runs for a real-time duration and
+requires sustained support, rather than accepting a single stable-looking
+final frame.
 """
 
 from __future__ import annotations
@@ -103,6 +107,12 @@ class SettledResult:
     ball_speed: float
     main_flex: np.ndarray
     distal_flex: np.ndarray
+    thumb_pose: np.ndarray
+    support_fraction: float
+    palm_contact_fraction: float
+    validation_z_drop: float
+    horizontal_drift: float
+    thumb_twist_score: float
     passed: bool
 
 
@@ -114,7 +124,38 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rounds", type=int, default=8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--physics-candidates", type=int, default=24)
-    parser.add_argument("--settle-steps", type=int, default=1500)
+    parser.add_argument(
+        "--settle-steps",
+        type=int,
+        default=1500,
+        help=(
+            "Minimum number of MuJoCo physics steps per candidate. The actual "
+            "number is increased when --validation-seconds requires more."
+        ),
+    )
+    parser.add_argument(
+        "--validation-seconds",
+        type=float,
+        default=10.0,
+        help="Minimum physical simulation duration for every final candidate.",
+    )
+    parser.add_argument(
+        "--validation-window-seconds",
+        type=float,
+        default=3.0,
+        help=(
+            "Final time window used to measure sustained contacts and drift."
+        ),
+    )
+    parser.add_argument(
+        "--min-support-fraction",
+        type=float,
+        default=0.90,
+        help=(
+            "Required fraction of the final validation window with at least "
+            "two finger contacts."
+        ),
+    )
     parser.add_argument(
         "--ball-search-radius",
         type=float,
@@ -426,6 +467,15 @@ def main() -> int:
         raise ValueError("--samples must be at least --rounds.")
     if args.physics_candidates < 1:
         raise ValueError("--physics-candidates must be positive.")
+    if args.validation_seconds <= 0.0:
+        raise ValueError("--validation-seconds must be positive.")
+    if not 0.0 < args.validation_window_seconds <= args.validation_seconds:
+        raise ValueError(
+            "--validation-window-seconds must be positive and no greater "
+            "than --validation-seconds."
+        )
+    if not 0.0 <= args.min_support_fraction <= 1.0:
+        raise ValueError("--min-support-fraction must be in [0, 1].")
 
     reference = _extract_allegro_reference()
     model = _load_leap_model()
@@ -457,6 +507,27 @@ def main() -> int:
     # qpos[3, 7, 11] are the final/distal flexion joints.
     main_flex_indices = np.asarray([2, 6, 10], dtype=np.int32)
     distal_flex_indices = np.asarray([3, 7, 11], dtype=np.int32)
+    thumb_indices = np.asarray([12, 13, 14, 15], dtype=np.int32)
+
+    # A natural LEAP thumb opposition family. This does not prescribe the
+    # contact surface; it only prevents the optimizer from twisting the thumb
+    # to extreme joint combinations in order to touch the ball.
+    thumb_reference = np.asarray(
+        [1.20, 0.78, 0.85, 0.25],
+        dtype=np.float64,
+    )
+    thumb_scale = np.asarray(
+        [0.38, 0.42, 0.55, 0.42],
+        dtype=np.float64,
+    )
+    thumb_search_lower = np.asarray(
+        [0.55, -0.05, -0.20, -0.20],
+        dtype=np.float64,
+    )
+    thumb_search_upper = np.asarray(
+        [1.65, 1.35, 1.55, 1.15],
+        dtype=np.float64,
+    )
 
     if args.distal_soft_limit <= 0.0:
         raise ValueError("--distal-soft-limit must be positive.")
@@ -471,6 +542,26 @@ def main() -> int:
     upper_hand[distal_flex_indices] = np.minimum(
         upper_hand[distal_flex_indices],
         float(args.distal_hard_limit),
+    )
+
+    lower_hand[thumb_indices] = np.maximum(
+        lower_hand[thumb_indices],
+        thumb_search_lower,
+    )
+    upper_hand[thumb_indices] = np.minimum(
+        upper_hand[thumb_indices],
+        thumb_search_upper,
+    )
+    if np.any(lower_hand[thumb_indices] >= upper_hand[thumb_indices]):
+        raise RuntimeError("The natural thumb search bounds are invalid.")
+
+    # Range-normalized Allegro-to-LEAP mapping drives the LEAP thumb close to
+    # its joint limits because the two hands use different axes and zero
+    # conventions. Use a LEAP-native opposition seed for the thumb instead.
+    mapped_hand[thumb_indices] = np.clip(
+        thumb_reference,
+        lower_hand[thumb_indices],
+        upper_hand[thumb_indices],
     )
 
     ball_delta = float(args.ball_search_radius)
@@ -644,6 +735,20 @@ def main() -> int:
             / 0.18
         ).sum()
 
+        thumb_pose = hand_qpos[thumb_indices]
+        thumb_pose_penalty = np.square(
+            (thumb_pose - thumb_reference) / thumb_scale
+        ).sum()
+
+        # Specifically discourage the visually twisted combination observed
+        # previously: excessive base/proximal rotation together with a
+        # strongly negative final joint.
+        thumb_twist_penalty = (
+            np.square(max(thumb_pose[0] - 1.50, 0.0) / 0.15)
+            + np.square(max(thumb_pose[1] - 1.15, 0.0) / 0.15)
+            + np.square(max(-0.08 - thumb_pose[3], 0.0) / 0.14)
+        )
+
         non_tip_ball_penetration = 0.0
         self_penetration = 0.0
         tip_id_set = {int(value) for value in tip_ids}
@@ -684,6 +789,8 @@ def main() -> int:
             + 2.0 * main_flex_penalty
             + 0.75 * distal_shape_penalty
             + 12.0 * distal_curl_penalty
+            + 3.0 * thumb_pose_penalty
+            + 10.0 * thumb_twist_penalty
             + 18.0 * non_tip_ball_penetration
             + 5.0 * self_penetration
         )
@@ -803,12 +910,39 @@ def main() -> int:
         mujoco.mj_forward(model, data)
 
         initial_z = float(data.qpos[18])
-        recent_z: list[float] = []
 
-        for step_index in range(args.settle_steps):
+        total_steps = max(
+            int(args.settle_steps),
+            int(np.ceil(args.validation_seconds / model.opt.timestep)),
+        )
+        window_steps = max(
+            2,
+            int(
+                np.ceil(
+                    args.validation_window_seconds / model.opt.timestep
+                )
+            ),
+        )
+        window_start = max(0, total_steps - window_steps)
+
+        recent_z: list[float] = []
+        recent_xy: list[np.ndarray] = []
+        recent_contact_counts: list[int] = []
+        recent_palm_contacts: list[bool] = []
+
+        for step_index in range(total_steps):
             mujoco.mj_step(model, data)
-            if step_index >= max(0, args.settle_steps - 250):
+
+            if step_index >= window_start:
+                step_contacts = _contact_values(model, data)
                 recent_z.append(float(data.qpos[18]))
+                recent_xy.append(data.qpos[16:18].copy())
+                recent_contact_counts.append(
+                    int(np.count_nonzero(step_contacts[:4] > 0.5))
+                )
+                recent_palm_contacts.append(
+                    bool(step_contacts[4] > 0.5)
+                )
 
         contacts = _contact_values(model, data)
         settled_gaps = _surface_gaps(
@@ -830,11 +964,43 @@ def main() -> int:
 
         final_z = float(data.qpos[18])
         ball_drop = initial_z - final_z
+
+        recent_z_array = np.asarray(recent_z, dtype=np.float64)
+        recent_xy_array = np.asarray(recent_xy, dtype=np.float64)
         recent_z_range = (
-            float(np.ptp(np.asarray(recent_z)))
-            if recent_z
+            float(np.ptp(recent_z_array))
+            if recent_z_array.size
             else 0.0
         )
+        validation_z_drop = (
+            float(recent_z_array[0] - recent_z_array[-1])
+            if recent_z_array.size >= 2
+            else 0.0
+        )
+        horizontal_drift = (
+            float(
+                np.linalg.norm(
+                    recent_xy_array[-1] - recent_xy_array[0]
+                )
+            )
+            if len(recent_xy_array) >= 2
+            else 0.0
+        )
+        support_fraction = (
+            float(
+                np.mean(
+                    np.asarray(recent_contact_counts, dtype=np.int32) >= 2
+                )
+            )
+            if recent_contact_counts
+            else 0.0
+        )
+        palm_contact_fraction = (
+            float(np.mean(recent_palm_contacts))
+            if recent_palm_contacts
+            else 1.0
+        )
+
         ball_speed = float(np.linalg.norm(data.qvel[16:19]))
         finger_contact_count = int(
             np.count_nonzero(contacts[:4] > 0.5)
@@ -842,6 +1008,7 @@ def main() -> int:
         palm_contact = bool(contacts[4] > 0.5)
         settled_main_flex = data.qpos[main_flex_indices].copy()
         settled_distal_flex = data.qpos[distal_flex_indices].copy()
+        settled_thumb_pose = data.qpos[thumb_indices].copy()
 
         settled_distal_excess = np.maximum(
             settled_distal_flex - float(args.distal_soft_limit),
@@ -855,14 +1022,42 @@ def main() -> int:
             <= float(args.distal_hard_limit) + 0.05
         )
 
+        thumb_twist_score = float(
+            np.square(
+                max(settled_thumb_pose[0] - 1.50, 0.0) / 0.15
+            )
+            + np.square(
+                max(settled_thumb_pose[1] - 1.15, 0.0) / 0.15
+            )
+            + np.square(
+                max(-0.08 - settled_thumb_pose[3], 0.0) / 0.14
+            )
+        )
+        thumb_bounds_ok = bool(
+            np.all(
+                settled_thumb_pose
+                >= thumb_search_lower - 0.05
+            )
+            and np.all(
+                settled_thumb_pose
+                <= thumb_search_upper + 0.05
+            )
+        )
+        thumb_shape_ok = thumb_bounds_ok and thumb_twist_score <= 1.5
+
         passed = (
             finger_contact_count >= 2
             and not palm_contact
-            and ball_drop <= 0.010
+            and support_fraction >= float(args.min_support_fraction)
+            and palm_contact_fraction <= 0.02
+            and ball_drop <= 0.012
             and recent_z_range <= 0.003
-            and ball_speed <= 0.040
+            and validation_z_drop <= 0.0015
+            and horizontal_drift <= 0.003
+            and ball_speed <= 0.020
             and float(np.max(settled_gaps)) <= 0.018
             and distal_shape_ok
+            and thumb_shape_ok
         )
 
         physics_penalty = (
@@ -877,6 +1072,19 @@ def main() -> int:
                 / 0.010
             )
             + 18.0 * settled_distal_penalty
+            + 80.0
+            * np.square(
+                max(
+                    float(args.min_support_fraction) - support_fraction,
+                    0.0,
+                )
+                / 0.20
+            )
+            + 80.0 * np.square(palm_contact_fraction / 0.05)
+            + 80.0
+            * np.square(max(validation_z_drop, 0.0) / 0.002)
+            + 40.0 * np.square(horizontal_drift / 0.003)
+            + 15.0 * thumb_twist_score
         )
 
         return SettledResult(
@@ -893,6 +1101,12 @@ def main() -> int:
             ball_speed=ball_speed,
             main_flex=settled_main_flex,
             distal_flex=settled_distal_flex,
+            thumb_pose=settled_thumb_pose,
+            support_fraction=support_fraction,
+            palm_contact_fraction=palm_contact_fraction,
+            validation_z_drop=validation_z_drop,
+            horizontal_drift=horizontal_drift,
+            thumb_twist_score=thumb_twist_score,
             passed=passed,
         )
 
@@ -911,7 +1125,10 @@ def main() -> int:
             f"contacts={np.round(result.contacts, 2).tolist()} "
             f"drop_mm={result.ball_drop * 1000:.2f} "
             f"speed={result.ball_speed:.4f} "
+            f"support={result.support_fraction:.2f} "
+            f"palm_frac={result.palm_contact_fraction:.2f} "
             f"max_distal={np.max(result.distal_flex):.3f} "
+            f"thumb_twist={result.thumb_twist_score:.2f} "
             f"palm_gap={result.palm_gap:.5f} "
             f"pass={result.passed}"
         )
@@ -955,6 +1172,24 @@ def main() -> int:
     print(
         "settled_distal_flex [q3,q7,q11]:",
         np.round(best_result.distal_flex, 6).tolist(),
+    )
+    print(
+        "settled_thumb_pose [q12,q13,q14,q15]:",
+        np.round(best_result.thumb_pose, 6).tolist(),
+    )
+    print(f"thumb_twist_score: {best_result.thumb_twist_score:.4f}")
+    print(f"support_fraction: {best_result.support_fraction:.4f}")
+    print(
+        f"palm_contact_fraction: "
+        f"{best_result.palm_contact_fraction:.4f}"
+    )
+    print(
+        f"validation_window_z_drop_mm: "
+        f"{best_result.validation_z_drop * 1000:.3f}"
+    )
+    print(
+        f"validation_horizontal_drift_mm: "
+        f"{best_result.horizontal_drift * 1000:.3f}"
     )
     print(f"settled_palm_gap: {best_result.palm_gap:.6f}")
     print(f"ball_drop_mm: {best_result.ball_drop * 1000:.3f}")

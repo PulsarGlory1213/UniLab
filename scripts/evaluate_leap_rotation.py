@@ -24,28 +24,36 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("policy", type=Path)
     parser.add_argument("--seconds", type=float, default=8.0)
+    parser.add_argument("--sim", choices=("mujoco", "motrix"), default="mujoco")
     parser.add_argument("--action-gain", type=float, default=1.0)
     parser.add_argument("--target-mode")
     parser.add_argument("--action-scale", type=float)
     parser.add_argument("--target-offset-limit", type=float, default=0.35)
     parser.add_argument("--output-video", type=Path)
+    parser.add_argument("--cache-index", type=int)
     args = parser.parse_args()
 
-    overrides = ["task=leap_inhand/motrix"]
+    overrides = [f"task=leap_inhand/{args.sim}"]
+    if args.cache_index is not None:
+        overrides.extend(
+            [
+                "+env.grasp_cache_sample_mode=sequential",
+                f"+env.grasp_cache_start_index={args.cache_index}",
+            ]
+        )
     if args.target_mode is not None:
         overrides.append(f"env.control_config.target_mode={args.target_mode}")
     if args.action_scale is not None:
         overrides.append(f"env.control_config.action_scale={args.action_scale}")
     if args.target_mode == "bounded_incremental":
-        overrides.append(
-            f"+env.control_config.target_offset_limit={args.target_offset_limit}"
-        )
+        overrides.append(f"+env.control_config.target_offset_limit={args.target_offset_limit}")
     with initialize_config_dir(config_dir=str(ROOT_DIR / "conf" / "appo"), version_base="1.3"):
         cfg = compose(config_name="config", overrides=overrides)
 
     ensure_registries()
     env_cfg = BackendAdapter(cfg, root_dir=ROOT_DIR, algo_name="appo").build_task_env_cfg_override()
     env = create_env(cfg, num_envs=1, env_cfg_override=env_cfg)
+    env.set_autoreset(False)
     if env.state is None:
         env.init_state()
 
@@ -77,7 +85,9 @@ def main() -> None:
 
         def infer(observation: np.ndarray) -> np.ndarray:
             with torch.inference_mode():
-                return actor.mlp(torch.from_numpy(observation)).numpy().astype(np.float32)
+                tensor = torch.from_numpy(observation)
+                normalized = actor.obs_normalizer(tensor)
+                return actor.mlp(normalized).numpy().astype(np.float32)
 
     else:
         raise ValueError(f"Unsupported policy file: {args.policy}")
@@ -85,6 +95,9 @@ def main() -> None:
     ctrl_dt = float(cfg.env.ctrl_dt)
     step_count = round(args.seconds / ctrl_dt)
     angular_velocity_z: list[float] = []
+    min_ball_z = float(np.min(env.get_ball_pos()[:, 2]))
+    terminated_any = False
+    min_contact_count = len(env._CONTACT_SENSORS)
 
     for _ in range(step_count):
         action = infer(obs_array) * args.action_gain
@@ -94,6 +107,16 @@ def main() -> None:
         angular_velocity = compute_ball_angvel(quat, previous_quat, ctrl_dt)
         angular_velocity_z.append(float(angular_velocity[0, 2]))
         previous_quat = quat.copy()
+        min_ball_z = min(min_ball_z, float(np.min(env.get_ball_pos()[:, 2])))
+        terminated_any |= bool(np.any(transition.terminated))
+        contacts = np.stack(
+            [
+                env._contact_flag(env.get_sensor_data(name))
+                for name in env._CONTACT_SENSORS
+            ],
+            axis=1,
+        )
+        min_contact_count = min(min_contact_count, int(np.min(np.sum(contacts, axis=1))))
 
     per_second = []
     steps_per_second = round(1.0 / ctrl_dt)
@@ -104,6 +127,11 @@ def main() -> None:
     print("per_second_rad:", " ".join(f"{value:+.4f}" for value in per_second))
     print(f"total_rad: {sum(per_second):+.4f}")
     print(f"last_4s_rad: {sum(per_second[-4:]):+.4f}")
+    print(
+        f"positive_seconds: {sum(value > 0.0 for value in per_second)}/{len(per_second)} "
+        f"min_ball_z: {min_ball_z:.6f} terminated: {terminated_any} "
+        f"min_contacts: {min_contact_count}"
+    )
 
     if args.output_video is not None:
         env.run_playback_mode(
@@ -125,6 +153,7 @@ def main() -> None:
                 "cam_lookat": list(cfg.training.cam_lookat),
                 "cam_elevation": float(cfg.training.cam_elevation),
                 "cam_azimuth": float(cfg.training.cam_azimuth),
+                "render_num_processes": int(cfg.training.render_num_processes),
             },
         )
 

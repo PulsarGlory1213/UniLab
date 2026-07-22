@@ -179,6 +179,8 @@ class APPORunner(AsyncRunner):
             lam=algo_cfg.get("lam", 0.95),
             value_loss_coef=algo_cfg.get("value_loss_coef", 1.0),
             entropy_coef=algo_cfg.get("entropy_coef", 0.01),
+            action_std_schedule=algo_cfg.get("action_std_schedule"),
+            entropy_coef_schedule=algo_cfg.get("entropy_coef_schedule"),
             learning_rate=algo_cfg.get("learning_rate", 1e-3),
             max_grad_norm=algo_cfg.get("max_grad_norm", 1.0),
             use_clipped_value_loss=algo_cfg.get("use_clipped_value_loss", True),
@@ -222,6 +224,7 @@ class APPORunner(AsyncRunner):
                 learner.optimizer.load_state_dict(checkpoint["optimizer"])
                 learner.learning_rate = _optimizer_lr_from_state(learner.optimizer)
             _sync_resume_target_actor(learner)
+        learner.apply_training_schedules(0, max_iterations)
 
         # --- memory budget check ---
         from unilab.ipc.memory_budget import estimate_appo_bytes, warn_if_over_budget
@@ -386,6 +389,7 @@ class APPORunner(AsyncRunner):
             train_start = time.time()
             learner.process_batch(combined)
             metrics = learner.update(combined)
+            learner.apply_training_schedules(iteration, max_iterations)
             train_time = time.time() - train_start
             weight_sync_start = time.perf_counter()
             actor_weight_sync.write_weights(learner.actor.state_dict())

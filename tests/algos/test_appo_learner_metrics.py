@@ -95,3 +95,47 @@ def test_appo_process_batch_syncs_target_actor_normalization_buffers():
         )
 
     assert float(kl.mean().item()) == pytest.approx(0.0, abs=5e-5)
+
+
+class _ScheduleDistribution:
+    def __init__(self) -> None:
+        self.std_type = "scalar"
+        self.std_param = nn.Parameter(torch.ones(2))
+
+
+class _ScheduleActor:
+    def __init__(self) -> None:
+        self.distribution = _ScheduleDistribution()
+
+
+def test_appo_training_schedules_control_std_and_entropy() -> None:
+    learner = object.__new__(APPOLearner)
+    learner.actor = _ScheduleActor()
+    learner.target_actor = _ScheduleActor()
+    learner.action_std_schedule = {
+        "initial": 0.5,
+        "final": 0.1,
+        "start_iteration": 0,
+        "end_iteration": 100,
+        "min_std": 0.1,
+        "max_std": 0.5,
+    }
+    learner.entropy_coef_schedule = {
+        "initial": 0.002,
+        "final": 0.0,
+        "start_iteration": 0,
+        "end_iteration": 100,
+    }
+
+    learner.apply_training_schedules(50, 100)
+
+    assert learner.entropy_coef == pytest.approx(0.001)
+    assert learner._scheduled_action_std == pytest.approx(0.3)
+    torch.testing.assert_close(
+        learner.actor.distribution.std_param,
+        torch.full((2,), 0.3),
+    )
+    torch.testing.assert_close(
+        learner.target_actor.distribution.std_param,
+        torch.full((2,), 0.3),
+    )
