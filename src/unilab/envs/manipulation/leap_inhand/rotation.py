@@ -153,7 +153,7 @@ class LeapInhandRotationCfg(LeapHandBaseCfg):
     domain_rand: DomainRandConfig = field(default_factory=DomainRandConfig)
     rotation_axis: tuple[float, float, float] = (0.0, 0.0, 1.0)
     rotation_cycle_seconds: float = 2.0
-    grasp_cache_path: str = "caches/leap_hand_allegro_style_20k.npy"
+    grasp_cache_path: str = "caches/leap_hand_seed_bank.npy"
     use_grasp_cache: bool = True
     grasp_cache_sample_mode: str = "random"
     grasp_cache_start_index: int = 0
