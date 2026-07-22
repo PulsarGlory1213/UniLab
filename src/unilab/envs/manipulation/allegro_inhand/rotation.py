@@ -218,6 +218,26 @@ class AllegroRotationDomainRandomizationProvider(DomainRandomizationProvider):
             "prev_ball_quat": np.asarray(ball_quat, dtype=dtype).copy(),
             "prev_ball_linvel": np.zeros((num_reset, 3), dtype=dtype),
             "prev_ball_angvel": np.zeros((num_reset, 3), dtype=dtype),
+            "curr_fingertip_contacts": np.zeros(
+                (num_reset, len(env._CONTACT_SENSORS)),
+                dtype=dtype,
+            ),
+            "contact_duration_steps": np.zeros(
+                (num_reset, len(env._CONTACT_SENSORS)),
+                dtype=dtype,
+            ),
+            "rotation_streak_steps": np.zeros(
+                num_reset,
+                dtype=np.uint32,
+            ),
+            "rotation_window": np.zeros(
+                (num_reset, env._rotation_window_steps),
+                dtype=dtype,
+            ),
+            "rotation_window_sum": np.zeros(
+                num_reset,
+                dtype=dtype,
+            ),
         }
         init_obs = env._build_current_obs(info_updates, init_ctrl, init_ball_pos)
         info_updates["obs_lag_history"] = build_obs_lag_history(
@@ -306,8 +326,15 @@ class AllegroRotationPPO(AllegroBaseEnv):
         return {"obs": self._NUM_OBS_PER_STEP * self._NUM_LAG_STEPS}
 
     def _init_reward_functions(self) -> None:
+        """Register the reward terms selected by the owner YAML."""
         self._reward_fns = {
             "rotate": self._reward_rotate,
+            "reverse_rotate": self._reward_reverse_rotate,
+            "rotation_streak": self._reward_rotation_streak,
+            "stall": self._reward_stall,
+            "contact_rotation": self._reward_contact_rotation,
+            "window_rotation": self._reward_window_rotation,
+            "palm_contact": self._reward_palm_contact,
             "obj_linvel": self._reward_obj_linvel,
             "pose_diff": self._reward_pose_diff,
             "torque": self._reward_torque,

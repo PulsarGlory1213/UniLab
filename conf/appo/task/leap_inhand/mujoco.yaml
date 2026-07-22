@@ -64,42 +64,46 @@ algo:
     obs_normalization: true
 reward:
   scales:
-    rotate: 3.0
-    reverse_rotate: -8.0
+    rotate: 2.0
+    reverse_rotate: -6.0
     rotation_streak: 1.0
-    stall: -0.5
+    stall: -0.25
     contact_rotation: 2.0
     window_rotation: 2.0
     palm_contact: -0.5
-    obj_linvel: -0.3
+    obj_linvel: -0.5
     pose_diff: 0.0
     torque: -0.001
     work: -0.0001
     drop: -10.0
   angvel_clip_min: 0.0
-  angvel_clip_max: 1.5
-  reverse_angvel_clip_max: 2.0
-  minimum_positive_angvel: 0.15
+  angvel_clip_max: 0.6
+  reverse_angvel_clip_max: 1.0
+  minimum_positive_angvel: 0.10
   rotation_window_seconds: 1.0
   rotation_streak_target_seconds: 2.0
-  stall_grace_seconds: 1.0
+  stall_grace_seconds: 1.5
   contact_rotation_min_contacts: 2
   reset_z_threshold: 0.54
-  rotation_warmup_seconds: 0.0
+  rotation_warmup_seconds: 0.5
 env:
   gen_grasp: false
-  # Reset from the replay-validated 20k stable-grasp cache.
   use_grasp_cache: true
+  grasp_cache_path: caches/leap_hand_seed_bank.npy
+  grasp_cache_sample_mode: random
   max_episode_seconds: 20.0
-  grasp_cache_path: caches/leap_hand_allegro_style_20k.npy
   rotation_axis: [0.0, 0.0, 1.0]
   rotation_cycle_seconds: 2.0
   ctrl_dt: 0.02
   control_config:
-    action_scale: 0.0416666667
-    target_mode: incremental
+    action_scale: 0.020
+    target_mode: bounded_incremental
+    target_offset_limit: 0.30
     kp: 20.0
     kd: 1.5
+  noise_config:
+    level: 0.0
+    scale_joint_angle: 0.02
   domain_rand:
     randomize_base_mass: false
     random_com: false
