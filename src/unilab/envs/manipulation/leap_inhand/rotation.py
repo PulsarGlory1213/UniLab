@@ -1,4 +1,4 @@
-"""LEAP Hand 球體指尖旋轉任務的完整獨立實作。
+="""LEAP Hand 球體指尖旋轉任務的完整獨立實作。
 
 包含設定、cache reset、domain randomization、reward、observation 與 state update。
 此模組不繼承或 import Allegro 任務。
@@ -118,6 +118,7 @@ class RewardConfigPPO:
     contact_rotation_min_contacts: int = 2
     stable_rotation_min_contacts: int = 3
     target_angvel: float = 0.20
+    window_progress_target_angvel: float = 0.30
     target_angvel_tolerance: float = 0.20
     stable_center_radius: float = 0.018
     stable_ball_linvel_max: float = 0.05
@@ -383,6 +384,10 @@ class LeapRotationDomainRandomizationProvider(DomainRandomizationProvider):
                 (num_reset, env._rotation_window_steps), dtype=dtype
             ),
             "rotation_window_sum": np.zeros(num_reset, dtype=dtype),
+            "rotation_total_window": np.zeros(
+                (num_reset, env._rotation_window_steps), dtype=dtype
+            ),
+            "rotation_total_window_sum": np.zeros(num_reset, dtype=dtype),
         }
         init_obs = env._build_current_obs(info_updates, init_ctrl, actual_ball_pos)
         info_updates["obs_lag_history"] = build_obs_lag_history(
@@ -531,6 +536,7 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
             "stall": self._reward_stall,
             "contact_rotation": self._reward_contact_rotation,
             "window_rotation": self._reward_window_rotation,
+            "window_rotation_progress": self._reward_window_rotation_progress,
             "stable_rotation": self._reward_stable_rotation,
             "off_axis_angvel": self._reward_off_axis_angvel,
             "angvel_rate": self._reward_angvel_rate,
@@ -653,6 +659,92 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
         )
         reward = np.clip(average_angvel, 0.0, self._reward_cfg.angvel_clip_max)
         return self._rotation_reward_active(info, reward)
+
+    def _reward_window_rotation_progress(
+        self,
+        info,
+        dof_pos,
+        dof_vel,
+        ball_pos,
+        ball_linvel,
+        ball_angvel,
+        torques,
+        terminated,
+    ) -> np.ndarray:
+        """Reward sustained useful rotation over a time window.
+
+        The reward uses integrated angular motion rather than a per-step
+        off-axis penalty. This lets the fingertips and thumb make brief
+        corrective motions, while still preferring trajectories whose net
+        motion is mostly positive rotation about the configured axis.
+        """
+        del dof_pos, dof_vel, ball_angvel, torques
+
+        signed_window = np.asarray(info["rotation_window"])
+        positive_progress = np.sum(np.maximum(signed_window, 0.0), axis=1)
+        total_progress = np.asarray(info["rotation_total_window_sum"])
+
+        steps = np.asarray(
+            info.get("steps", np.zeros(positive_progress.shape[0], dtype=np.uint32))
+        )
+        valid_steps = np.minimum(steps + 1, self._rotation_window_steps)
+        valid_duration = np.maximum(
+            valid_steps.astype(get_global_dtype()) * float(self._cfg.ctrl_dt),
+            float(self._cfg.ctrl_dt),
+        )
+
+        target_angvel = float(self._reward_cfg.window_progress_target_angvel)
+        if target_angvel <= 0.0:
+            raise ValueError("reward.window_progress_target_angvel must be positive")
+
+        target_progress = target_angvel * valid_duration
+        progress_score = np.clip(
+            positive_progress / np.maximum(target_progress, 1e-6),
+            0.0,
+            1.0,
+        )
+
+        axis_efficiency = np.clip(
+            positive_progress / np.maximum(total_progress, 1e-6),
+            0.0,
+            1.0,
+        )
+
+        contacts = np.asarray(info["curr_fingertip_contacts"])
+        contact_count = np.sum(contacts > 0.5, axis=1)
+        thumb_contact = contacts[:, 3] > 0.5
+        center_error = np.linalg.norm(
+            ball_pos - np.asarray(info["init_ball_pos"]),
+            axis=1,
+        )
+        linvel_ok = (
+            np.linalg.norm(ball_linvel, axis=1)
+            <= float(self._reward_cfg.stable_ball_linvel_max)
+        )
+
+        stable_gate = (
+            thumb_contact
+            & (
+                contact_count
+                >= int(self._reward_cfg.stable_rotation_min_contacts)
+            )
+            & (
+                center_error
+                <= float(self._reward_cfg.stable_center_radius)
+            )
+            & linvel_ok
+            & ~terminated
+        )
+
+        reward = (
+            progress_score
+            * axis_efficiency
+            * stable_gate.astype(get_global_dtype())
+        )
+        return np.asarray(
+            self._rotation_reward_active(info, reward),
+            dtype=get_global_dtype(),
+        )
 
     def _reward_stable_rotation(
         self, info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
@@ -1017,6 +1109,33 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
             rotation_window_sum - old_angle + new_angle,
             dtype=get_global_dtype(),
         )
+
+        rotation_total_window = np.asarray(
+            state.info.get(
+                "rotation_total_window",
+                np.zeros(
+                    (self._num_envs, self._rotation_window_steps),
+                    dtype=get_global_dtype(),
+                ),
+            )
+        )
+        rotation_total_window_sum = np.asarray(
+            state.info.get(
+                "rotation_total_window_sum",
+                np.zeros(self._num_envs, dtype=get_global_dtype()),
+            )
+        )
+        old_total_angle = rotation_total_window[env_indices, cursor].copy()
+        new_total_angle = np.linalg.norm(ball_angvel, axis=1) * float(
+            self._cfg.ctrl_dt
+        )
+        rotation_total_window[env_indices, cursor] = new_total_angle
+        state.info["rotation_total_window"] = rotation_total_window
+        state.info["rotation_total_window_sum"] = np.asarray(
+            rotation_total_window_sum - old_total_angle + new_total_angle,
+            dtype=get_global_dtype(),
+        )
+
         state.info["prev_dof_pos"] = dof_pos.copy()
         state.info["prev_ball_pos"] = ball_pos.copy()
         state.info["prev_ball_quat"] = ball_quat.copy()

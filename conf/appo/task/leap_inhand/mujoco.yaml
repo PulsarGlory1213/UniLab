@@ -20,25 +20,32 @@ training:
     output_subdir: videos
 
 algo:
+  # Fine-tuning configuration for the already successful rotation policy.
   num_envs: 1024
   steps_per_env: 64
-  max_iterations: 400
+  max_iterations: 300
   save_interval: 50
+
   algorithm:
     value_loss_coef: 4.0
-    entropy_coef: 0.0015
+
+    # Keep exploration small enough to preserve the good grasping strategy,
+    # while still allowing the policy to discover more efficient finger motion.
+    entropy_coef: 0.0012
     entropy_coef_schedule:
-      initial: 0.0015
+      initial: 0.0012
       final: 0.0003
       start_iteration: 0
-      end_iteration: 400
+      end_iteration: 300
+
     action_std_schedule:
-      initial: 0.20
+      initial: 0.16
       final: 0.08
       start_iteration: 0
-      end_iteration: 400
+      end_iteration: 300
       min_std: 0.06
-      max_std: 0.25
+      max_std: 0.22
+
     learning_rate: 0.0001
     desired_kl: 0.02
     adaptive_kl_factor: 2.0
@@ -51,14 +58,16 @@ algo:
     max_grad_norm: 1.0
     use_clipped_value_loss: true
     schedule: adaptive
+
   actor:
     hidden_dims: [512, 256, 128]
     activation: elu
     obs_normalization: true
     distribution_cfg:
       class_name: rsl_rl.modules.distribution.GaussianDistribution
-      init_std: 0.25
+      init_std: 0.16
       std_type: scalar
+
   critic:
     hidden_dims: [512, 256, 128]
     activation: elu
@@ -66,27 +75,30 @@ algo:
 
 reward:
   scales:
-    # 主要任務：真正產生穩定正向旋轉
-    stable_rotation: 7.0
-    rotation_streak: 0.75
+    # Instantaneous reward stays close to the last successful configuration.
+    stable_rotation: 4.0
+
+    # New term: integrated positive rotation over the last time window,
+    # multiplied by whole-window axis efficiency.
+    window_rotation_progress: 3.0
+
+    rotation_streak: 0.5
     stall: -1.0
 
-    # 接觸只作為輕微輔助，不再讓「靜止握住」成為主要得分來源
     thumb_contact: 0.10
     support_contact: 0.15
 
-    # 保留球心穩定，但不要壓制所有必要的小幅位移
-    ball_center: -2.0
+    ball_center: -2.5
     center_recovery: 1.0
-    obj_linvel: -0.3
+    obj_linvel: -0.4
 
-    # 讓旋轉軸更純、速度更均勻
-    off_axis_angvel: -0.25
-    angvel_rate: -0.02
+    action_rate: -0.008
+    thumb_distal_posture: -0.02
 
-    # 動作平順，但不能把手指鎖死
-    action_rate: -0.006
-    thumb_distal_posture: -0.015
+    # Per-step dynamic penalties remain disabled. The new window reward
+    # evaluates efficiency without punishing brief corrective motions.
+    off_axis_angvel: 0.0
+    angvel_rate: 0.0
 
     palm_contact: -1.0
     reverse_rotate: -4.0
@@ -103,33 +115,35 @@ reward:
   angvel_clip_max: 0.8
   reverse_angvel_clip_max: 1.0
 
-  # 0.40 rad/s：一圈約 15.7 秒，比前一版更有效率但仍保守
-  target_angvel: 0.40
+  # Preserve the safe instantaneous target learned by the successful policy.
+  target_angvel: 0.30
+  target_angvel_tolerance: 0.30
 
-  # 小於 target，完全不轉時 reward 仍為 0
-  target_angvel_tolerance: 0.35
-  minimum_positive_angvel: 0.08
+  # The one-second integrated reward gently asks for slightly more progress
+  # without forcing every individual control step to run at 0.33 rad/s.
+  window_progress_target_angvel: 0.33
+
+  minimum_positive_angvel: 0.05
 
   rotation_window_seconds: 1.0
   rotation_streak_target_seconds: 2.0
   stall_grace_seconds: 1.0
 
-  # 允許拇指 + 任一手指的兩指支撐階段
   stable_rotation_min_contacts: 2
   contact_rotation_min_contacts: 2
-#++
-  # 稍微放寬球心與線速度，讓球能在指間滾動
-  stable_center_radius: 0.026
-  stable_ball_linvel_max: 0.09
 
-  # 允許轉球必要的小幅球心位移，超過 deadzone 才開始扣分
-  ball_center_xy_deadzone: 0.005
-  ball_center_z_deadzone: 0.003
+  stable_center_radius: 0.025
+  stable_ball_linvel_max: 0.08
+
+  # Continuous center feedback: no deadzone, so the thumb receives an
+  # immediate signal when the ball begins to drift.
+  ball_center_xy_deadzone: 0.0
+  ball_center_z_deadzone: 0.0
   ball_center_xy_scale: 0.018
   ball_center_z_scale: 0.015
   ball_center_penalty_clip: 16.0
 
-  # 旋轉軸純度與速度平順度
+  # Kept for backward compatibility; their reward weights above are zero.
   off_axis_angvel_scale: 0.30
   off_axis_angvel_penalty_clip: 9.0
   angvel_delta_scale: 0.08
@@ -142,7 +156,6 @@ reward:
   max_ball_drop_from_init: 0.040
   reset_z_threshold: 0.54
 
-  # 不需要等完整一秒才開始學旋轉
   rotation_warmup_seconds: 0.25
 
   thumb_distal_q14_scale: 0.30
