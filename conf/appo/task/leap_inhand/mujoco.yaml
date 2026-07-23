@@ -22,24 +22,24 @@ training:
 algo:
   num_envs: 1024
   steps_per_env: 64
-  max_iterations: 1000
+  max_iterations: 400
   save_interval: 50
   algorithm:
     value_loss_coef: 4.0
-    entropy_coef: 0.003
+    entropy_coef: 0.0015
     entropy_coef_schedule:
-      initial: 0.003
-      final: 0.0005
+      initial: 0.0015
+      final: 0.0003
       start_iteration: 0
-      end_iteration: 800
+      end_iteration: 400
     action_std_schedule:
-      initial: 0.35
-      final: 0.12
+      initial: 0.20
+      final: 0.08
       start_iteration: 0
-      end_iteration: 1000
-      min_std: 0.08
-      max_std: 0.40
-    learning_rate: 0.0003
+      end_iteration: 400
+      min_std: 0.06
+      max_std: 0.25
+    learning_rate: 0.0001
     desired_kl: 0.02
     adaptive_kl_factor: 2.0
     adaptive_lr_factor: 1.5
@@ -67,8 +67,8 @@ algo:
 reward:
   scales:
     # 主要任務：真正產生穩定正向旋轉
-    stable_rotation: 6.0
-    rotation_streak: 0.5
+    stable_rotation: 7.0
+    rotation_streak: 0.75
     stall: -1.0
 
     # 接觸只作為輕微輔助，不再讓「靜止握住」成為主要得分來源
@@ -76,13 +76,17 @@ reward:
     support_contact: 0.15
 
     # 保留球心穩定，但不要壓制所有必要的小幅位移
-    ball_center: -2.5
+    ball_center: -2.0
     center_recovery: 1.0
-    obj_linvel: -0.4
+    obj_linvel: -0.3
+
+    # 讓旋轉軸更純、速度更均勻
+    off_axis_angvel: -0.25
+    angvel_rate: -0.02
 
     # 動作平順，但不能把手指鎖死
-    action_rate: -0.008
-    thumb_distal_posture: -0.02
+    action_rate: -0.006
+    thumb_distal_posture: -0.015
 
     palm_contact: -1.0
     reverse_rotate: -4.0
@@ -99,12 +103,12 @@ reward:
   angvel_clip_max: 0.8
   reverse_angvel_clip_max: 1.0
 
-  # 0.30 rad/s：一圈約 21 秒，已經能明顯看到旋轉
-  target_angvel: 0.30
+  # 0.40 rad/s：一圈約 15.7 秒，比前一版更有效率但仍保守
+  target_angvel: 0.40
 
-  # 必須 <= target，才能保證完全不轉時 reward 為 0
-  target_angvel_tolerance: 0.30
-  minimum_positive_angvel: 0.05
+  # 小於 target，完全不轉時 reward 仍為 0
+  target_angvel_tolerance: 0.35
+  minimum_positive_angvel: 0.08
 
   rotation_window_seconds: 1.0
   rotation_streak_target_seconds: 2.0
@@ -115,12 +119,21 @@ reward:
   contact_rotation_min_contacts: 2
 #++
   # 稍微放寬球心與線速度，讓球能在指間滾動
-  stable_center_radius: 0.025
-  stable_ball_linvel_max: 0.08
+  stable_center_radius: 0.026
+  stable_ball_linvel_max: 0.09
 
+  # 允許轉球必要的小幅球心位移，超過 deadzone 才開始扣分
+  ball_center_xy_deadzone: 0.005
+  ball_center_z_deadzone: 0.003
   ball_center_xy_scale: 0.018
   ball_center_z_scale: 0.015
   ball_center_penalty_clip: 16.0
+
+  # 旋轉軸純度與速度平順度
+  off_axis_angvel_scale: 0.30
+  off_axis_angvel_penalty_clip: 9.0
+  angvel_delta_scale: 0.08
+  angvel_delta_penalty_clip: 9.0
 
   recovery_activation_distance: 0.004
   recovery_progress_scale: 0.003
@@ -174,7 +187,7 @@ env:
     scale_joint_angle: 0.02
 
   domain_rand:
-    recovery_reset_fraction: 0.25
+    recovery_reset_fraction: 0.15
     thumb_root_noise: 0.05
     thumb_distal_noise: 0.015
     ball_xy_offset: 0.002

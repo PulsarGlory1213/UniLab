@@ -132,6 +132,12 @@ class RewardConfigPPO:
     thumb_distal_q15_scale: float = 0.20
     thumb_root_action_rate_weight: float = 0.50
     thumb_distal_action_rate_weight: float = 1.50
+    off_axis_angvel_scale: float = 0.30
+    off_axis_angvel_penalty_clip: float = 9.0
+    angvel_delta_scale: float = 0.08
+    angvel_delta_penalty_clip: float = 9.0
+    ball_center_xy_deadzone: float = 0.005
+    ball_center_z_deadzone: float = 0.003
 
 
 @dataclass
@@ -526,6 +532,8 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
             "contact_rotation": self._reward_contact_rotation,
             "window_rotation": self._reward_window_rotation,
             "stable_rotation": self._reward_stable_rotation,
+            "off_axis_angvel": self._reward_off_axis_angvel,
+            "angvel_rate": self._reward_angvel_rate,
             "thumb_contact": self._reward_thumb_contact,
             "support_contact": self._reward_support_contact,
             "ball_center": self._reward_ball_center,
@@ -682,6 +690,52 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
             info, speed_reward * stable_gate.astype(get_global_dtype())
         )
 
+    def _reward_off_axis_angvel(
+        self, info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+    ) -> np.ndarray:
+        """Penalize angular velocity that does not contribute to the target axis."""
+        del dof_pos, dof_vel, ball_pos, ball_linvel, torques
+        signed_angvel = ball_angvel @ self._rot_axis
+        axial_angvel = signed_angvel[:, None] * self._rot_axis[None, :]
+        off_axis_angvel = ball_angvel - axial_angvel
+        scale = float(self._reward_cfg.off_axis_angvel_scale)
+        if scale <= 0.0:
+            raise ValueError("reward.off_axis_angvel_scale must be positive")
+        penalty = np.square(np.linalg.norm(off_axis_angvel, axis=1) / scale)
+        penalty = np.clip(
+            penalty,
+            0.0,
+            float(self._reward_cfg.off_axis_angvel_penalty_clip),
+        )
+        penalty = np.where(terminated, 0.0, penalty)
+        return np.asarray(
+            self._rotation_reward_active(info, penalty),
+            dtype=get_global_dtype(),
+        )
+
+    def _reward_angvel_rate(
+        self, info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
+    ) -> np.ndarray:
+        """Penalize abrupt changes in target-axis angular velocity."""
+        del dof_pos, dof_vel, ball_pos, ball_linvel, torques
+        previous_angvel = np.asarray(info.get("prev_ball_angvel", ball_angvel))
+        current_signed = ball_angvel @ self._rot_axis
+        previous_signed = previous_angvel @ self._rot_axis
+        scale = float(self._reward_cfg.angvel_delta_scale)
+        if scale <= 0.0:
+            raise ValueError("reward.angvel_delta_scale must be positive")
+        penalty = np.square((current_signed - previous_signed) / scale)
+        penalty = np.clip(
+            penalty,
+            0.0,
+            float(self._reward_cfg.angvel_delta_penalty_clip),
+        )
+        penalty = np.where(terminated, 0.0, penalty)
+        return np.asarray(
+            self._rotation_reward_active(info, penalty),
+            dtype=get_global_dtype(),
+        )
+
     def _reward_thumb_contact(
         self, info, dof_pos, dof_vel, ball_pos, ball_linvel, ball_angvel, torques, terminated
     ) -> np.ndarray:
@@ -709,8 +763,16 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
         z_scale = float(self._reward_cfg.ball_center_z_scale)
         if xy_scale <= 0.0 or z_scale <= 0.0:
             raise ValueError("ball-center reward scales must be positive")
-        penalty = np.square(np.linalg.norm(center_error[:, :2], axis=1) / xy_scale)
-        penalty += np.square(np.abs(center_error[:, 2]) / z_scale)
+        xy_deadzone = float(self._reward_cfg.ball_center_xy_deadzone)
+        z_deadzone = float(self._reward_cfg.ball_center_z_deadzone)
+        if xy_deadzone < 0.0 or z_deadzone < 0.0:
+            raise ValueError("ball-center reward deadzones must be non-negative")
+        xy_error = np.linalg.norm(center_error[:, :2], axis=1)
+        z_error = np.abs(center_error[:, 2])
+        xy_excess = np.maximum(xy_error - xy_deadzone, 0.0)
+        z_excess = np.maximum(z_error - z_deadzone, 0.0)
+        penalty = np.square(xy_excess / xy_scale)
+        penalty += np.square(z_excess / z_scale)
         return np.asarray(
             np.clip(penalty, 0.0, float(self._reward_cfg.ball_center_penalty_clip)),
             dtype=get_global_dtype(),
@@ -981,6 +1043,7 @@ class LeapInhandRotationEnv(LeapHandBaseEnv):
         )
         obs = self._compute_obs(state.info, dof_pos, ball_pos)
         state.info["prev_center_error"] = current_center_error.copy()
+        state.info["prev_ball_angvel"] = ball_angvel.copy()
         return state.replace(obs=obs, reward=reward, terminated=terminated)
 
     def _compute_reward(
